@@ -1,0 +1,128 @@
+name: build and publish releases
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag name (e.g. v1.0.0)"
+        required: false
+        default: "v1.0.0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux:
+    name: build-linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            deb_arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            deb_arch: arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            python3 python3-pip python3-gi python3-cairo python3-gi-cairo \
+            gir1.2-gtk-4.0 gir1.2-adw-1 libadwaita-1-dev dpkg-dev
+
+      - name: Install PyInstaller
+        run: |
+          python3 -m pip install --break-system-packages --upgrade pip pyinstaller
+
+      - name: Build standalone bundle, tarball, and Debian package
+        run: |
+          python3 scripts/build.py --deb --output-dir dist_release
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}-artifacts
+          path: |
+            dist_release/*.tar.gz
+            dist_release/*.deb
+          if-no-files-found: error
+
+  build-windows:
+    name: build-windows (x86_64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 with GTK4 and Libadwaita
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-pip
+            mingw-w64-ucrt-x86_64-python-gobject
+            mingw-w64-ucrt-x86_64-python-cairo
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-libadwaita
+            mingw-w64-ucrt-x86_64-graphene
+            mingw-w64-ucrt-x86_64-gdk-pixbuf2
+
+      - name: Build Windows release bundle in MSYS2
+        shell: msys2 {0}
+        run: |
+          export GI_TYPELIB_PATH=/ucrt64/lib/girepository-1.0:$GI_TYPELIB_PATH
+          python -m pip install --upgrade pip pyinstaller
+          python scripts/build.py --output-dir dist_release
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-artifacts
+          path: dist_release/*.zip
+          if-no-files-found: error
+
+  publish-release:
+    name: publish-release
+    needs: [build-linux, build-windows]
+    if: always() && (needs.build-linux.result == 'success' || needs.build-windows.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+          merge-multiple: true
+
+      - name: Display downloaded artifacts
+        run: ls -lh release_assets/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || (inputs.tag_name || 'v1.0.0') }}
+          name: "VPN Gate Client ${{ github.ref_type == 'tag' && github.ref_name || (inputs.tag_name || 'v1.0.0') }}"
+          files: release_assets/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false

@@ -1,0 +1,53 @@
+name: refresh relay data
+
+# Regular refresh of the two committed data files the client reads online:
+#   data/mirrors.json — the mirror list scraped from
+#                       https://www.vpngate.net/en/sites.aspx
+#   data/servers.csv  — a verbatim copy of the official relay CSV feed
+#                       https://www.vpngate.net/api/iphone/
+#
+# The app reads both (via GitHub raw / jsDelivr) when its compiled-in
+# mirrors are unreachable, so this job keeps the fallback chain alive.
+
+on:
+  schedule:
+    # Run every 10 minutes to keep relay mirrors and servers up to date
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-relay-data
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch the daily mirror list and the relay CSV
+        run: python scripts/update_data.py
+
+      - name: Commit the refreshed data (if anything changed)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          if git diff --cached --quiet; then
+            echo "No changes to the relay data today."
+          else
+            git commit \
+              -m "chore(data): refresh daily mirror list + relay CSV [skip ci]"
+            git push
+          fi

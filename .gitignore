@@ -1,0 +1,25 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Private SSH/dev harness (contains remote credentials)
+_tools/
+
+# Runtime artifacts
+state/
+logs/
+*.log
+shot*.png
+
+# Build and release artifacts
+build/
+build_tmp/
+dist/
+dist_release/
+*.spec
+*.deb
+*.tar.gz
+*.zip
+*.exe
+_internal/
+
