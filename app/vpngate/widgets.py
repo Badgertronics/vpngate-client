@@ -18,6 +18,7 @@ driven animation honours ``gtk-enable-animations`` so the desktop's
 """
 from __future__ import annotations
 
+import sys
 import time
 from typing import List
 
@@ -50,6 +51,21 @@ CSS_BASE = """
 .chip-ping-ok   { background-color: rgba(34,197,94,0.14);  color: #26a45c; }
 .chip-ping-mid  { background-color: rgba(217,119,6,0.15);  color: #d97706; }
 .chip-ping-slow { background-color: rgba(239,68,68,0.14);  color: #ef4444; }
+
+.flag-badge {
+    background-color: alpha(@accent_color, 0.16);
+    color: @accent_fg_color;
+    border-radius: 6px;
+    padding: 1px 6px;
+    font-size: 80%;
+    font-weight: 800;
+    letter-spacing: 0.05em;
+}
+.error-hint {
+    color: #ef4444;
+    font-size: 88%;
+    font-weight: 600;
+}
 
 /* ---- muted helper text -------------------------------------------------- */
 .dim    { color: rgba(127,127,127,0.95); font-size: 90%; }
@@ -173,6 +189,29 @@ def flag_emoji(code: str) -> str:
     if len(code) != 2 or not code.isalpha():
         return ""
     return "".join(chr(0x1F1E6 + ord(ch) - ord("A")) for ch in code)
+
+
+def flag_text(code: str) -> str:
+    """Country display string: clean code badge on Windows, emoji flag elsewhere."""
+    code = (code or "").upper().strip()
+    if not code:
+        return "🌐"
+    if sys.platform == "win32":
+        return f"[{code}]"
+    return flag_emoji(code) or "🌐"
+
+
+def flag_widget(code: str) -> Gtk.Widget:
+    """Return a country flag widget appropriate for the platform."""
+    code = (code or "").upper().strip()
+    if sys.platform == "win32":
+        return Gtk.Label(label=code or "??",
+                         css_classes=["flag-badge"],
+                         valign=Gtk.Align.CENTER)
+    emoji = flag_emoji(code) or "🌐"
+    return Gtk.Label(label=emoji,
+                     css_classes=["flag"],
+                     valign=Gtk.Align.CENTER)
 
 
 def ping_level(ping_ms: int) -> str:
@@ -344,7 +383,7 @@ class StatusRing(Gtk.DrawingArea):
             self._stop_tick()
         self.queue_draw()
 
-    def _on_tick(self, _area, _clock, _data) -> bool:
+    def _on_tick(self, _area, _clock, *args) -> bool:
         self.queue_draw()
         now = time.monotonic()
         if self.mode in ("connecting", "authorizing"):

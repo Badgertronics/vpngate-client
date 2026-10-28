@@ -1,14 +1,18 @@
-"""Static configuration for the VPN Gate Client application."""
 import os
+import sys
 
 APP_NAME = "VPN Gate Client"
-APP_ID = "vpngate-gui"
-VERSION = "1.0.1"
+APP_ID = "com.vpngate.client"
+VERSION = "1.0.2"
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 STATE_DIR = os.path.join(BASE_DIR, "state")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 CONFIG_FILE = os.path.join(STATE_DIR, "settings.json")

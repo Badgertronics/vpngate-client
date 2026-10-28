@@ -36,14 +36,18 @@ from .config import (APP_NAME, DEFAULT_MIRRORS, DEVELOPER_NAME,  # noqa: E402
 from .models import PROTOCOL_ORDER, Protocol, VpnServer  # noqa: E402
 from .tray import Tray                                # noqa: E402
 from .widgets import (SpeedBar, StatusRing, Segmented, apply_theme_css,
-                      flag_emoji, ping_chip, ping_level, protocol_chip,
-                      protocol_name, skeleton_rows, stat_chip)  # noqa: E402
+                      flag_emoji, flag_text, flag_widget, ping_chip,
+                      ping_level, protocol_chip, protocol_name,
+                      skeleton_rows, stat_chip)  # noqa: E402
 
 APP_ID = "com.vpngate.client"
 APP_LOG = "VPN Gate Client"
 _QUICK_COUNTRIES = ("JP", "KR", "TH")
 
-ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if getattr(sys, "frozen", False):
+    ROOT_DIR = os.path.dirname(sys.executable)
+else:
+    ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ICONS_DIR = os.path.join(ROOT_DIR, "icons", "hicolor", "scalable", "apps")
 
 
@@ -218,7 +222,16 @@ class VpnGateApp(Adw.Application):
         if display is not None:
             apply_theme_css()
             theme = Gtk.IconTheme.get_for_display(display)
-            theme.add_search_path(ICONS_DIR)
+            for candidate in (
+                ICONS_DIR,
+                os.path.join(ROOT_DIR, "icons"),
+                os.path.join(ROOT_DIR, "icons", "hicolor", "scalable", "apps"),
+                os.path.join(os.path.dirname(__file__), "..", "icons", "hicolor", "scalable", "apps"),
+                os.path.join(os.path.dirname(__file__), "..", "icons"),
+            ):
+                if os.path.isdir(candidate):
+                    theme.add_search_path(candidate)
+                    theme.add_search_path(os.path.dirname(candidate))
         self.win = VpnGateWindow(self)
         self.win.present()
         if self.settings.get("tray", True):
@@ -702,10 +715,35 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self.log_view.scroll_to_iter(end, 0.0, True, 1.0, 1.0)
         return False
 
+    def copy_to_clipboard(self, text: str) -> None:
+        copied = False
+        try:
+            cb = self.get_clipboard()
+            if hasattr(cb, "set"):
+                cb.set(text)
+                copied = True
+            elif hasattr(cb, "set_text"):
+                cb.set_text(text)
+                copied = True
+        except Exception:
+            pass
+        if sys.platform == "win32":
+            try:
+                import subprocess
+                subprocess.run(
+                    ["clip.exe"],
+                    input=text.encode("utf-16le"),
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                copied = True
+            except Exception:
+                pass
+
     def _copy_log(self, *args) -> None:                # noqa: ANN001
         start, end = self.log_buffer.get_bounds()
-        self.get_clipboard().set_text(
-            self.log_buffer.get_text(start, end, False))
+        text = self.log_buffer.get_text(start, end, False)
+        self.copy_to_clipboard(text)
         self.toast(_("Log copied to the clipboard"))
 
     def toast(self, message: str, retry: bool = False) -> None:
@@ -1577,7 +1615,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         dialog = Adw.PreferencesDialog()
         dialog.props.title = _("Settings")
         dialog.add(self._appearance_page())
-        dialog.add(self._mirrors_page())
+        dialog.add(self._mirrors_page(dialog))
         dialog.add(self._support_page())
         dialog.props.search_enabled = False
         dialog.present(self)
@@ -1631,7 +1669,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         page.add(layout_group)
         return page
 
-    def _mirrors_page(self) -> Adw.PreferencesPage:
+    def _mirrors_page(self, dialog: Optional[Adw.PreferencesDialog] = None) -> Adw.PreferencesPage:
         page = Adw.PreferencesPage(title=_("Mirror sites"),
                                    icon_name="globe-symbolic")
         self._mirror_group = Adw.PreferencesGroup(
@@ -1644,19 +1682,46 @@ class VpnGateWindow(Adw.ApplicationWindow):
 
         add_group = Adw.PreferencesGroup(title=_("Add a mirror"))
         entry = Adw.EntryRow(title=_("New mirror URL"), show_apply_button=True)
+        error_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                            margin_start=12, margin_end=12, margin_top=4)
+        error_label = Gtk.Label(label="", css_classes=["error-hint"],
+                                xalign=0, wrap=True, visible=False)
+        error_box.append(error_label)
+
+        def on_entry_text_changed(row, _param) -> None:
+            if error_label.get_visible():
+                error_label.set_visible(False)
+
+        entry.connect("notify::text", on_entry_text_changed)
 
         def add_mirror(_row) -> None:              # noqa: ANN001
             url = (entry.get_text() or "").strip().rstrip("/")
-            if url.startswith("http") and len(url) > 7:
+            if (url.startswith("http://") or url.startswith("https://")) and len(url) > 8:
+                error_label.set_visible(False)
                 self.mirrors.append(url)
                 self._persist_mirrors()
                 self._fill_mirror_rows()
                 self._append_log(_("Mirror added: {url}").format(url=url))
+                entry.set_text("")
+                toast = Adw.Toast.new(_("Mirror added successfully"))
+                if dialog is not None and hasattr(dialog, "add_toast"):
+                    dialog.add_toast(toast)
+                else:
+                    self.toast(_("Mirror added successfully"))
             else:
-                self.toast(_("That does not look like an http(s) URL"))
-            entry.set_text("")
+                msg = _("Invalid URL. Please enter a full address starting with http:// or https://")
+                error_label.set_text(msg)
+                error_label.set_visible(True)
+                toast = Adw.Toast.new(msg)
+                toast.props.timeout = 10
+                if dialog is not None and hasattr(dialog, "add_toast"):
+                    dialog.add_toast(toast)
+                else:
+                    self.toast(msg)
+
         entry.connect("apply", add_mirror)
         add_group.add(entry)
+        add_group.add(error_box)
         page.add(add_group)
 
         tray_group = Adw.PreferencesGroup(title=_("Options"))
@@ -1720,26 +1785,22 @@ class VpnGateWindow(Adw.ApplicationWindow):
         return page
 
     def _copy_donation_address(self, _button, address: str) -> None:
-        self.get_clipboard().set_text(address)
+        self.copy_to_clipboard(address)
         self.toast(_("Address copied to the clipboard"))
 
     def _fill_mirror_rows(self) -> None:
-        """Rebuild the mirror ActionRows.
-
-        AdwPreferencesGroup wraps its rows in an internal GtkBox, so
-        ``get_first_child()`` returns *that* box - removing it floods the
-        journal with "tried to remove non-child" and corrupts the dialog.
-        Therefore we keep our own list of rows and remove only those.
-        """
+        """Rebuild the mirror ActionRows for the active preferences dialog."""
         group = getattr(self, "_mirror_group", None)
         if group is None:
             return
-        for row in list(getattr(self, "_mirror_rows", [])):
+        old_rows = getattr(group, "_mirror_rows", [])
+        for row in list(old_rows):
             try:
-                group.remove(row)
+                if row.get_parent() is not None:
+                    group.remove(row)
             except Exception:                      # noqa: BLE001
-                pass                               # group from an old dialog
-        self._mirror_rows = []
+                pass                               # non-child or already removed
+        group._mirror_rows = []
         for index, url in enumerate(self.mirrors):
             row = Adw.ActionRow(title=url, title_lines=1)
             up = Gtk.Button(icon_name="go-up-symbolic",
@@ -1763,7 +1824,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
             for widget in (check, up, down, trash):
                 row.add_suffix(widget)
             group.add(row)
-            self._mirror_rows.append(row)
+            group._mirror_rows.append(row)
 
     def _persist_mirrors(self) -> None:
         self.settings["mirrors"] = list(self.mirrors)

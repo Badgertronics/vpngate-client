@@ -1,157 +1,83 @@
-# VPN Gate Client
+# 🛡️ VPN Gate Client 🚀
 
-A graphical VPN Gate client for Linux desktops (built for Ubuntu 24/26 with
-GNOME/Wayland in mind). It downloads the daily relay list, presents it in a
-searchable, filterable table and connects with the protocols the relays
-actually speak - SSL-VPN (SoftEther), MS-SSTP and L2TP/IPsec are working
-implementations; OpenVPN and PPTP are present but usually unusable for other
-reasons (see "Protocol status").
+> **A fast, modern, and easy-to-use desktop VPN client for the public [VPN Gate](https://www.vpngate.net) network! 🌍✨**
 
-The heavy lifting runs in one long-lived **root worker** process that talks
-JSON lines over stdin/stdout, so the desktop application itself stays
-unprivileged and the user is asked for administrative rights only once, via
-`pkexec` (polkit) with a `sudo` fallback.
-
-## Protocol status (practically, in 2026)
-
-| Protocol    | Status                                                      |
-|-------------|-------------------------------------------------------------|
-| SSL-VPN     | **Works** (SoftEther) - most reliable protocol              |
-| L2TP/IPsec  | **Works** - needs the checksum fixer; IKE-timeout relays exist |
-| MS-SSTP     | **Works**                                                   |
-| OpenVPN     | Blocked by a TLS wall on many relay links; kept for completeness |
-| PPTP        | No VPN Gate relays serve PPTP any more                      |
-
-Relay availability is volatile: many servers run today, die this afternoon.
-JP/KR/TH relays generally survive censorship better than most. When a
-connection fails because the server's virtual DHCP (SecureNAT) did not
-answer, the client tells you so - just try the next server.
-
-## Install
-
-On the target machine:
-
-    sudo ./app/install.sh
-
-This installs the app to `~/VPNGate`, all required packages
-(`python3-gi`, `python3-gi-cairo`, `gir1.2-gtk-4.0`, `gir1.2-adw-1`,
-`openvpn`, `strongswan-swanctl`, `xl2tpd`, `sstp-client`, `ppp`,
-`python3-netfilterqueue`, `softether-vpnclient` …), the interpreter/cairo
-bridge needed for the animated widgets, the **application + tray icons**
-(installed into the hicolor icon theme) and the desktop entry ("VPN Gate
-Client" in the application menu, `Icon=com.vpngate.client`), plus the TUN
-module autoload. Tray bindings (`libayatana-appindicator3`) are installed
-op-portunistically; if they are missing the client still works, just
-without the tray icon.
-
-## Run
-
-From the menu ("VPN Gate Client"), or directly:
-
-    ~/VPNGate/vpngate_gui.py
-
-1. The server list downloads automatically (repository mirrors first, then
-   the compiled-in mirrors, then this repo's `servers.csv`, then the CDN
-   snapshot when everything else is unreachable).
-2. Pick a row (JP/KR/TH first is a good heuristic), select a protocol
-   (SSL-VPN is the default), press **Connect** and authorise once: polkit
-   (`pkexec`) asks through its own desktop dialog; if no polkit agent is
-   available in your session the client asks for your user password and
-   uses `sudo` instead.
-3. The status bar shows the tunnel interface, tunnel IP, your public IP as
-   seen through the tunnel and the session time.
-
-## Layout
-
-    app/
-      vpngate_gui.py        GUI entry point
-      worker_main.py        privileged worker entry point (as root)
-      install.sh            installer
-      icons/hicolor/...     application + tray SVG icons
-      vpngate/
-        ui.py               GTK4 + libadwaita interface
-        widgets.py          stylesheet + animated widgets (StatusRing, chips…)
-        tray.py             tray parent (JSON over pipes)
-        tray_worker.py      isolated GTK3 tray child (libayatana)
-        worker.py           JSON-lines command loop (connect/disconnect/status)
-        privilege.py        pkexec / sudo spawning
-        fetcher.py          mirror scraping + repo/CDN CSV fallbacks + parsers
-        models.py           VpnServer dataclass + Protocol enum
-        backends.py         SoftEther/SSL-VPN, L2TP/IPsec, MS-SSTP, OpenVPN
-        netutil.py          DHCP client, routing, interface helpers
-        csumfix.py          NFQUEUE ESP-in-UDP checksum fixer (L2TP)
-        config.py           mirrors, credentials, timeouts, donation wallets
-    scripts/
-      update_data.py        refreshes data/ (also runnable locally)
-    data/
-      mirrors.json          daily mirror list (committed by the Action)
-      servers.csv           daily copy of the official relay CSV
-
-`_tools/` on the development machine is the private SSH harness used to
-build and verify the client against a real machine; it holds remote
-credentials and is therefore **not** part of the published tree.
-
-## Relay data refresh (GitHub Action)
-
-`.github/workflows/refresh-mirrors.yml` runs `scripts/update_data.py`
-every 10 minutes (and can be triggered manually from the Actions
-tab). It
-
-1. scrapes the mirror list from
-   https://www.vpngate.net/en/sites.aspx into `data/mirrors.json`, and
-2. downloads the official relay CSV from
-   https://www.vpngate.net/api/iphone/ into `data/servers.csv`,
-
-then commits any change as
-`chore(data): refresh daily mirror list + relay CSV [skip ci]`.
-Both files can also be refreshed locally with `python scripts/update_data.py`.
-
-## Building & Releases (CI / CD)
-
-Precompiled packages are built and published automatically by
-`.github/workflows/release.yml` on every tag release (e.g. `v1.0.0`) or manual
-workflow dispatch:
-- **Linux x86_64 (`amd64`)**: Standalone `.tar.gz` and Debian `.deb` package
-- **Linux ARM64 (`aarch64`)**: Standalone `.tar.gz` and Debian `.deb` package
-- **Windows x86_64**: Standalone `.zip` package
-
-To build release packages locally:
-
-    # Build standalone tarball (and .deb on Debian/Ubuntu):
-    python scripts/build.py --deb
-
-    # Output files will be located in dist_release/
-
-The client reads them online — no rebuild needed: when the mirrors it knows
-are unreachable, it fetches `data/mirrors.json` (fresh mirrors) and, failing
-that, `data/servers.csv` (the whole server table) via
-`raw.githubusercontent.com` and the jsDelivr CDN copies of this repository.
-
-## Notes for users behind censorship
-
-- If **every** mirror returns HTTP 500 / TLS resets, the list still arrives
-  from the CDN snapshot; connections themselves may also be filtered - VPN
-  Gate traffic is not stealth traffic, a charting firewall can detect it.
-- L2TP needs the checksum fixer only when the tunnel passes routers that
-  rewrite ESP-in-UDP packets badly (very common on home routers); the
-  client installs and removes the fixer automatically per session.
-- If the same server repeatedly fails its DHCP phase, its SecureNAT is
-  dead - not a client problem; rotate servers.
-
-## ☕ Buy me a coffee
-
-If this client saves you when the open internet is a brick wall away,
-a coffee is always appreciated. Send any amount to one of these wallets
-(copy-paste friendly):
-
-| Network                     | Address                                |
-|-----------------------------|----------------------------------------|
-| Bitcoin (BTC)               | `bc1q3l2gxktlc3r9f6z325d920kqhv8kwctqdyvxmh`          |
-| Ethereum (ETH / ERC-20)     | `0x9C2Cde3575769e104E93bC934abbfE2D883e8dCa`          |
-| BEP20 (BNB Smart Chain)     | `0x9C2Cde3575769e104E93bC934abbfE2D883e8dCa`        |
+Connect to thousands of free community-operated VPN relays around the globe with a single click. Bypass censorship, protect your privacy, and access the open web with ease! 🔓🎉
 
 ---
 
-*VPN Gate Client* — built by **Mr. Honey Badger (Badgertronics)**.
- VPN Gate is an academic experiment by the University of Tsukuba;
-this client is an independent desktop GUI for its public relays.
+## 📥 Downloads 💾
+
+Grab the latest release for your operating system from the **[Releases](https://github.com/Badgertronics/vpngate-client/releases/latest)** page! 🎁
+
+| 🖥️ OS / Architecture | 📦 Package Type | 🚀 Description |
+| :--- | :--- | :--- |
+| **🪟 Windows (64-bit)** | `.zip` | Portable standalone package (no installer required!) |
+| **🐧 Linux (Debian / Ubuntu / Mint)** | `.deb` | 1-click installable Debian package |
+| **🐧 Linux (Generic 64-bit)** | `.tar.gz` | Portable standalone archive |
+| **🐧 Linux (ARM64 / Raspberry Pi)** | `.deb` / `.tar.gz` | ARM64 packages |
+
+---
+
+## 🚀 Quick Start Guide 🏁
+
+### 🪟 For Windows Users
+1. 📥 Download `vpngate-client-vX.X.X-windows-x86_64.zip` from [Releases](https://github.com/Badgertronics/vpngate-client/releases/latest).
+2. 📂 Extract the `.zip` archive to a folder of your choice (e.g. `Downloads` or `Desktop`).
+3. ⚡ Double-click **`vpngate-gui.exe`** to launch! 🎈
+4. 🌐 Pick a server from the list (servers in 🇯🇵 Japan or 🇰🇷 Korea are usually super fast and stable) and click **Connect**! 🟢
+
+---
+
+### 🐧 For Linux Users
+
+#### Option A: Install Debian/Ubuntu Package (`.deb`) 🌟
+```bash
+# 📥 Download the .deb package from Releases, then install it:
+sudo dpkg -i vpngate-client_*.deb
+sudo apt-get install -f   # (resolves any missing packages automatically)
+```
+🎉 Now launch **VPN Gate Client** directly from your application launcher, or run `vpngate-gui` in your terminal!
+
+#### Option B: Portable Tarball (`.tar.gz`) 📦
+```bash
+tar -xvf vpngate-client-*-linux-x86_64.tar.gz
+cd vpngate-client
+./vpngate-gui
+```
+
+---
+
+## ✨ Awesome Features 🌟
+
+- ⚡ **1-Click Connect**: Instant connections to high-speed public relays.
+- 🛡️ **Bypass Censorship**: Built-in support for **SSL-VPN (SoftEther)**, **MS-SSTP**, and **L2TP/IPsec** to penetrate firewalls.
+- 🔄 **Always Up-to-Date**: Automatically syncs the freshest relay lists and active mirrors every few minutes!
+- 🎨 **Modern & Beautiful UI**: Clean GTK4 / Libadwaita interface with dark mode and desktop notifications.
+- 🧩 **Zero Spyware, 100% Free**: No subscription, no account registration, and no tracking.
+
+---
+
+## 💡 Quick Tips for the Best Connection 🎯
+
+- 🗾 **Server Recommendations**: Relays located in Japan (🇯🇵) and South Korea (🇰🇷) typically have the highest bandwidth and reliability.
+- 🛡️ **Best Protocol**: We recommend using **SSL-VPN** (default) — it is the most resilient against restrictive firewalls.
+- 🔄 **Stuck on connecting?**: VPN Gate servers are operated by volunteers worldwide. If a server doesn't respond within a few seconds, simply click **Cancel** and select another server!
+
+---
+
+## ☕ Support the Project 💖
+
+If this client helps you stay connected and browse the web freely, consider buying me a coffee! ☕🍰 Any support is greatly appreciated:
+
+- 🪙 **Bitcoin (BTC)**: `bc1q3l2gxktlc3r9f6z325d920kqhv8kwctqdyvxmh`
+- 💎 **Ethereum (ETH / ERC-20)**: `0x9C2Cde3575769e104E93bC934abbfE2D883e8dCa`
+- 🟡 **BNB Smart Chain (BEP20)**: `0x9C2Cde3575769e104E93bC934abbfE2D883e8dCa`
+
+---
+
+## 📜 Credits & License 🦡
+
+- 👨‍💻 Created and maintained by **Mr. Honey Badger ([Badgertronics](https://github.com/Badgertronics))**.
+- 🎓 Relay infrastructure provided by the **[VPN Gate Project](https://www.vpngate.net)** (University of Tsukuba, Japan).
+- ⚖️ Open source software distributed under the MIT License.

@@ -11,8 +11,8 @@ name: refresh relay data
 
 on:
   schedule:
-    # Run every 10 minutes to keep relay mirrors and servers up to date
-    - cron: "*/10 * * * *"
+    # Run every 5 minutes to keep relay mirrors and servers up to date
+    - cron: "*/5 * * * *"
   workflow_dispatch:
 
 permissions:

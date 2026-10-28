@@ -78,6 +78,9 @@ def build_pyinstaller(build_dir: Path, dist_dir: Path) -> Path:
         shutil.rmtree(bundle_dir)
 
     hooks_dir = ROOT / "scripts" / "hooks"
+    icon_path = APP_DIR / "icons" / "vpngate.ico"
+    icon_args = ["--icon", str(icon_path)] if icon_path.exists() else []
+
     print("==> Building GUI executable with PyInstaller...")
     gui_cmd = [
         pyinstaller,
@@ -85,6 +88,7 @@ def build_pyinstaller(build_dir: Path, dist_dir: Path) -> Path:
         "--onedir",
         "--clean",
         "--name", "vpngate-gui",
+        *icon_args,
         "--distpath", str(bundle_dir),
         "--workpath", str(build_dir / "build-gui"),
         "--additional-hooks-dir", str(hooks_dir),
@@ -99,6 +103,7 @@ def build_pyinstaller(build_dir: Path, dist_dir: Path) -> Path:
         "--onedir",
         "--clean",
         "--name", "vpngate-worker",
+        *icon_args,
         "--distpath", str(bundle_dir),
         "--workpath", str(build_dir / "build-worker"),
         str(APP_DIR / "worker_main.py"),
@@ -127,10 +132,14 @@ def build_pyinstaller(build_dir: Path, dist_dir: Path) -> Path:
     icons_src = APP_DIR / "icons"
     if icons_src.exists():
         shutil.copytree(str(icons_src), str(out_dir / "icons"), dirs_exist_ok=True)
+        if (out_dir / "_internal").exists():
+            shutil.copytree(str(icons_src), str(out_dir / "_internal" / "icons"), dirs_exist_ok=True)
 
     data_src = ROOT / "data"
     if data_src.exists():
         shutil.copytree(str(data_src), str(out_dir / "data"), dirs_exist_ok=True)
+        if (out_dir / "_internal").exists():
+            shutil.copytree(str(data_src), str(out_dir / "_internal" / "data"), dirs_exist_ok=True)
 
     install_src = APP_DIR / "install.sh"
     if install_src.exists():
