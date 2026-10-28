@@ -69,7 +69,22 @@ class OpenVpnBackend:
     supports = (Protocol.OPENVPN,)
 
     def available(self) -> bool:
+        if sys.platform == "win32":
+            return bool(self._openvpn_bin())
         return bool(netutil.which("openvpn"))
+
+    @staticmethod
+    def _openvpn_bin() -> str:
+        if sys.platform == "win32":
+            found = shutil.which("openvpn")
+            if found:
+                return found
+            for p in (r"C:\Program Files\OpenVPN\bin\openvpn.exe",
+                      r"C:\Program Files (x86)\OpenVPN\bin\openvpn.exe"):
+                if os.path.exists(p):
+                    return p
+            return ""
+        return netutil.which("openvpn") or ""
 
     # -- configuration ----------------------------------------------------
     @staticmethod
@@ -158,9 +173,9 @@ class OpenVpnBackend:
     # -- connect / disconnect --------------------------------------------
     def connect(self, server: VpnServer, protocol: Protocol, emit: Emit,
                 workdir: str) -> dict:
-        config = self.build_config(server, workdir, emit)
+        openvpn_bin = self._openvpn_bin() or "openvpn"
         cmd = [
-            "openvpn", "--config", config,
+            openvpn_bin, "--config", config,
             # Pin TLS 1.2: newer OpenVPN clients send a 1.5 kB ClientHello
             # which the SoftEther based relay servers cannot parse.
             "--tls-version-min", "1.2", "--tls-version-max", "1.2",
@@ -282,7 +297,22 @@ class SoftEtherBackend:
     NIC = "VPN"                             # virtual adapter name
 
     def available(self) -> bool:
+        if sys.platform == "win32":
+            return bool(self._vpncmd_bin())
         return bool(netutil.which(self.VPNCMD)) and os.path.exists(self.SERVICE)
+
+    @staticmethod
+    def _vpncmd_bin() -> str:
+        for name in ("vpncmd", "vpncmd_x64", "vpncmd.exe", "vpncmd_x64.exe"):
+            found = shutil.which(name)
+            if found:
+                return found
+        for p in (r"C:\Program Files\SoftEther VPN Client\vpncmd_x64.exe",
+                  r"C:\Program Files\SoftEther VPN Client\vpncmd.exe",
+                  r"C:\Program Files (x86)\SoftEther VPN Client\vpncmd.exe"):
+            if os.path.exists(p):
+                return p
+        return ""
 
     # -- vpncmd helpers ---------------------------------------------------
     @staticmethod
@@ -577,7 +607,68 @@ class SstpBackend:
     supports = (Protocol.SSTP,)
 
     def available(self) -> bool:
+        if sys.platform == "win32":
+            return bool(shutil.which("rasdial") or os.path.exists(r"C:\Windows\System32\rasdial.exe"))
         return bool(netutil.which("sstpc")) and bool(netutil.which("pppd"))
+
+    def _connect_windows(self, server: VpnServer, protocol: Protocol, emit: Emit,
+                         workdir: str) -> dict:
+        host = server.sstp_host or server.hostname or server.ip
+        if host and "." not in host:
+            host = f"{host}.opengw.net"
+
+        vpn_name = "VPNGate"
+        _log_emit(emit, f"[sstp 1/3] Configuring native Windows MS-SSTP connection to {host} ...")
+        started = time.monotonic()
+
+        subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
+                       capture_output=True, text=True, timeout=10)
+
+        ps_add = (
+            f"Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; "
+            f"Remove-VpnConnection -Name '{vpn_name}' -Force -ErrorAction SilentlyContinue; "
+            f"Add-VpnConnection -Name '{vpn_name}' -ServerAddress '{host}' -TunnelType Sstp "
+            f"-EncryptionLevel Optional -AuthenticationMethod Pap,Chap,MSChapv2 "
+            f"-SplitTunneling:$false -Force"
+        )
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_add],
+            capture_output=True, text=True, timeout=30
+        )
+        if res.returncode != 0:
+            err = res.stderr.strip() or res.stdout.strip()
+            raise BackendError(f"Failed to create Windows VPN profile for MS-SSTP: {err}")
+
+        _log_emit(emit, f"[sstp 2/3] Dialing {vpn_name} ({host}) via Windows RAS ...")
+        dial_res = subprocess.run(
+            ["rasdial", vpn_name, VPN_USERNAME, VPN_PASSWORD],
+            capture_output=True, text=True, timeout=60
+        )
+        output = (dial_res.stdout or "") + (dial_res.stderr or "")
+        for line in output.splitlines():
+            line = line.strip()
+            if line:
+                _log_emit(emit, f"[rasdial] {line}")
+
+        if dial_res.returncode != 0 or "successfully connected" not in output.lower():
+            subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
+                           capture_output=True, text=True, timeout=10)
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                            f"Remove-VpnConnection -Name '{vpn_name}' -Force -ErrorAction SilentlyContinue"],
+                           capture_output=True, text=True, timeout=10)
+            last_line = output.strip().splitlines()[-1] if output.strip() else "connection failed"
+            raise BackendError(f"MS-SSTP connection failed: {last_line}")
+
+        _log_emit(emit, f"[sstp 3/3] Connected in {_since(started)}: Windows MS-SSTP tunnel is active")
+        return {
+            "protocol": protocol.value,
+            "server": f"{server.hostname or host} ({server.ip})",
+            "interface": vpn_name,
+            "ip": server.ip,
+            "gateway": host,
+            "detail": {"vpn_name": vpn_name, "host": host},
+            "windows_vpn": vpn_name,
+        }
 
     def _write_ppp_options(self, workdir: str) -> str:
         secrets = os.path.join(workdir, "pap-secrets")
@@ -608,6 +699,8 @@ class SstpBackend:
 
     def connect(self, server: VpnServer, protocol: Protocol, emit: Emit,
                 workdir: str) -> dict:
+        if sys.platform == "win32":
+            return self._connect_windows(server, protocol, emit, workdir)
         port = server.sstp_port
         if not port:
             raise BackendError("This server does not offer the MS-SSTP service.")
@@ -702,6 +795,16 @@ class SstpBackend:
         return ""
 
     def disconnect(self, info: dict, emit: Emit) -> None:
+        if sys.platform == "win32":
+            vpn_name = info.get("windows_vpn") or "VPNGate"
+            _log_emit(emit, f"[sstp] Disconnecting Windows RAS connection {vpn_name} ...")
+            subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
+                           capture_output=True, text=True, timeout=15)
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                            f"Remove-VpnConnection -Name '{vpn_name}' -Force -ErrorAction SilentlyContinue"],
+                           capture_output=True, text=True, timeout=15)
+            _log_emit(emit, "Windows MS-SSTP disconnected.")
+            return
         started = time.monotonic()
         proc = info.get("process")
         if proc is not None:
@@ -746,7 +849,65 @@ class L2tpBackend:
     _fixer_proc = None                      # UDP-checksum fixer daemon
 
     def available(self) -> bool:
+        if sys.platform == "win32":
+            return bool(shutil.which("rasdial") or os.path.exists(r"C:\Windows\System32\rasdial.exe"))
         return bool(netutil.which("xl2tpd")) and bool(netutil.which("swanctl"))
+
+    def _connect_windows(self, server: VpnServer, protocol: Protocol, emit: Emit,
+                         workdir: str) -> dict:
+        host = server.ip or server.hostname
+        vpn_name = "VPNGate"
+        _log_emit(emit, f"[l2tp 1/3] Configuring native Windows L2TP/IPsec connection to {host} ...")
+        started = time.monotonic()
+
+        subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
+                       capture_output=True, text=True, timeout=10)
+
+        ps_add = (
+            f"Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; "
+            f"Remove-VpnConnection -Name '{vpn_name}' -Force -ErrorAction SilentlyContinue; "
+            f"Add-VpnConnection -Name '{vpn_name}' -ServerAddress '{host}' -TunnelType L2tp "
+            f"-L2tpPsk '{VPN_PSK}' -EncryptionLevel Optional -AuthenticationMethod Pap,Chap,MSChapv2 "
+            f"-SplitTunneling:$false -Force"
+        )
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_add],
+            capture_output=True, text=True, timeout=30
+        )
+        if res.returncode != 0:
+            err = res.stderr.strip() or res.stdout.strip()
+            raise BackendError(f"Failed to create Windows VPN profile for L2TP/IPsec: {err}")
+
+        _log_emit(emit, f"[l2tp 2/3] Dialing {vpn_name} ({host}) via Windows RAS with PSK ...")
+        dial_res = subprocess.run(
+            ["rasdial", vpn_name, VPN_USERNAME, VPN_PASSWORD],
+            capture_output=True, text=True, timeout=60
+        )
+        output = (dial_res.stdout or "") + (dial_res.stderr or "")
+        for line in output.splitlines():
+            line = line.strip()
+            if line:
+                _log_emit(emit, f"[rasdial] {line}")
+
+        if dial_res.returncode != 0 or "successfully connected" not in output.lower():
+            subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
+                           capture_output=True, text=True, timeout=10)
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                            f"Remove-VpnConnection -Name '{vpn_name}' -Force -ErrorAction SilentlyContinue"],
+                           capture_output=True, text=True, timeout=10)
+            last_line = output.strip().splitlines()[-1] if output.strip() else "connection failed"
+            raise BackendError(f"L2TP/IPsec connection failed: {last_line}")
+
+        _log_emit(emit, f"[l2tp 3/3] Connected in {_since(started)}: Windows L2TP/IPsec tunnel is active")
+        return {
+            "protocol": protocol.value,
+            "server": f"{server.hostname or host} ({server.ip})",
+            "interface": vpn_name,
+            "ip": server.ip,
+            "gateway": host,
+            "detail": {"vpn_name": vpn_name, "host": host},
+            "windows_vpn": vpn_name,
+        }
 
     # -- inbound UDP-checksum workaround -------------------------------------
     # Cheap SOHO routers NAT the ESP-in-UDP flow without refreshing the UDP
@@ -987,6 +1148,8 @@ class L2tpBackend:
 
     def connect(self, server: VpnServer, protocol: Protocol, emit: Emit,
                 workdir: str) -> dict:
+        if sys.platform == "win32":
+            return self._connect_windows(server, protocol, emit, workdir)
         started = time.monotonic()
         _log_emit(emit, f"[l2tp 1/5] Writing the L2TP/PPP definitions for "
                         f"{server.ip}:1701 (IKE PSK is the fixed 'vpn') ...")
@@ -1078,6 +1241,16 @@ class L2tpBackend:
         return ""
 
     def disconnect(self, info: dict, emit: Emit) -> None:
+        if sys.platform == "win32":
+            vpn_name = info.get("windows_vpn") or "VPNGate"
+            _log_emit(emit, f"[l2tp] Disconnecting Windows RAS connection {vpn_name} ...")
+            subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
+                           capture_output=True, text=True, timeout=15)
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                            f"Remove-VpnConnection -Name '{vpn_name}' -Force -ErrorAction SilentlyContinue"],
+                           capture_output=True, text=True, timeout=15)
+            _log_emit(emit, "Windows L2TP/IPsec disconnected.")
+            return
         started = time.monotonic()
         proc = info.get("process")
         _log_emit(emit, "[l2tp] Hanging up the L2TP call (terminating xl2tpd) ...")

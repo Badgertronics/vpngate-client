@@ -43,6 +43,7 @@ from .widgets import (SpeedBar, StatusRing, Segmented, apply_theme_css,
 APP_ID = "com.vpngate.client"
 APP_LOG = "VPN Gate Client"
 _QUICK_COUNTRIES = ("JP", "KR", "TH")
+DEFAULT_PROTOCOL = "sstp" if sys.platform == "win32" else "sslvp"
 
 if getattr(sys, "frozen", False):
     ROOT_DIR = os.path.dirname(sys.executable)
@@ -135,11 +136,12 @@ def sort_servers(servers: List[VpnServer], mode: str) -> List[VpnServer]:
 
 
 def recommended_server(servers: List[VpnServer]) -> Optional[VpnServer]:
-    """Best pick right now: SSL-VPN, JP/KR/TH first, then score."""
-    ssl = [s for s in servers if s.supports(Protocol.SSLVP)]
-    pool = [s for s in ssl
+    """Best pick right now: SSTP on Windows, SSL-VPN on Linux, JP/KR/TH first, then score."""
+    target_proto = Protocol.SSTP if sys.platform == "win32" else Protocol.SSLVP
+    pool_all = [s for s in servers if s.supports(target_proto)]
+    pool = [s for s in pool_all
             if (s.country_code or "").upper() in _QUICK_COUNTRIES]
-    pool = pool or ssl or list(servers)
+    pool = pool or pool_all or list(servers)
     if not pool:
         return None
     return max(pool, key=lambda s: (s.score, s.speed_mbps, -s.ping_ms))
@@ -147,10 +149,11 @@ def recommended_server(servers: List[VpnServer]) -> Optional[VpnServer]:
 
 def quick_stack(servers: List[VpnServer], limit: int = 3) -> List[VpnServer]:
     """A short list of one-click servers for the 'recommended' strip."""
+    target_proto = Protocol.SSTP if sys.platform == "win32" else Protocol.SSLVP
     picks: List[VpnServer] = []
     preferred = [s for s in servers
                  if (s.country_code or "").upper() in _QUICK_COUNTRIES
-                 and s.supports(Protocol.SSLVP)]
+                 and s.supports(target_proto)]
     for server in sorted(preferred, key=lambda s: -s.score):
         if len(picks) >= limit:
             break
@@ -158,7 +161,7 @@ def quick_stack(servers: List[VpnServer], limit: int = 3) -> List[VpnServer]:
             picks.append(server)
     if len(picks) < limit:
         for server in sort_servers(
-            [s for s in servers if s.supports(Protocol.SSLVP)], "recommended"
+            [s for s in servers if s.supports(target_proto)], "recommended"
         ):
             if len(picks) >= limit:
                 break
@@ -362,13 +365,12 @@ class VpnGateWindow(Adw.ApplicationWindow):
                        self.auth_banner):
             self.banners.append(banner)
         clip_box.append(self.banners)
-
-        clip_box.append(self._build_hero())
+        clip_box.append(self._build_filters())
         self.quick_strip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
                                    spacing=8, visible=False)
         clip_box.append(self.quick_strip)
-        clip_box.append(self._build_filters())
         clip_box.append(self._build_list_stack())
+        clip_box.append(self._build_hero())
 
     def _banner(self, text: str, button_label: Optional[str] = None) -> Adw.Banner:
         banner = Adw.Banner()
@@ -453,14 +455,14 @@ class VpnGateWindow(Adw.ApplicationWindow):
                                         "Thailand are picked first, then "
                                         "the highest score"))
         self.quick_strip.append(note)
+        proto_label = "MS-SSTP" if sys.platform == "win32" else "SSL-VPN"
         for server in picks:
             button = Gtk.Button(
                 css_classes=["chip", "chip-teal"],
-                tooltip_text=_("Connect now to {host} via SSL-VPN").format(
-                    host=server.hostname or server.ip))
+                tooltip_text=_("Connect now to {host} via {proto}").format(
+                    host=server.hostname or server.ip, proto=proto_label))
             line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-            line.append(Gtk.Label(label=flag_emoji(server.country_code) or "🌐",
-                                  valign=Gtk.Align.CENTER))
+            line.append(flag_widget(server.country_code))
             name = (server.hostname or server.ip or "?").split(".")[0]
             line.append(Gtk.Label(label=name, valign=Gtk.Align.CENTER,
                                   css_classes=["dim-x"],
@@ -581,9 +583,12 @@ class VpnGateWindow(Adw.ApplicationWindow):
         scroller.set_child(box)
 
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        self.details_flag = Gtk.Label(label="", css_classes=["hero-title"])
+        flag_css = ["flag-badge"] if sys.platform == "win32" else ["hero-title"]
+        self.details_flag = Gtk.Label(label="", css_classes=flag_css,
+                                      valign=Gtk.Align.CENTER)
         self.details_country = Gtk.Label(xalign=0, wrap=True,
-                                         css_classes=["title-4"])
+                                         css_classes=["title-4"],
+                                         valign=Gtk.Align.CENTER)
         header.append(self.details_flag)
         header.append(self.details_country)
         box.append(header)
@@ -620,13 +625,6 @@ class VpnGateWindow(Adw.ApplicationWindow):
         box.append(self.details_proto)
         self.port_hint = Gtk.Label(xalign=0, wrap=True, css_classes=["dim"])
         box.append(self.port_hint)
-
-        self.details_connect = Gtk.Button(
-            label=_("Connect with this server"),
-            css_classes=["vpn-connect", "suggested-action", "pill"])
-        self.details_connect.connect("clicked", self._on_details_connect)
-        self.details_connect.set_sensitive(False)
-        box.append(self.details_connect)
         return scroller
 
     # -- log bottom sheet --------------------------------------------------------
@@ -634,17 +632,14 @@ class VpnGateWindow(Adw.ApplicationWindow):
         sheet = Adw.BottomSheet()
         sheet.props.full_width = True
         sheet.props.modal = False
+        sheet.props.open = False
         sheet.props.show_drag_handle = True
-        # NOTE: 'sheet-height' is read-only in this libadwaita build (it
-        # reports the height once the sheet is open); leave the default.
         sheet.props.content = self.split
 
         panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
-                        margin_top=10, margin_start=14, margin_end=14,
-                        margin_bottom=14)
-        # Roomy, fixed-height log drawer: the height never changes with
-        # connection state, so the layout around it stays stable.
-        panel.props.height_request = 420
+                        margin_top=8, margin_start=14, margin_end=14,
+                        margin_bottom=10)
+        panel.props.height_request = 260
         head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         head.append(Gtk.Label(label=_("Connection log"), xalign=0,
                               css_classes=["title-4"], hexpand=True))
@@ -1013,8 +1008,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12,
                        margin_top=8, margin_bottom=8,
                        margin_start=10, margin_end=10)
-        line.append(Gtk.Label(label=flag_emoji(server.country_code) or "🌐",
-                              valign=Gtk.Align.CENTER))
+        line.append(flag_widget(server.country_code))
 
         center = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3,
                          hexpand=True, valign=Gtk.Align.CENTER)
@@ -1065,14 +1059,13 @@ class VpnGateWindow(Adw.ApplicationWindow):
                 self.selected = self._row_for[idx]
                 break
         if self.selected is None:
-            self.details_connect.set_sensitive(False)
             return
         self._show_details(self.selected)
         self.split.set_show_sidebar(True)
 
     # -- details ---------------------------------------------------------------
     def _show_details(self, server: VpnServer) -> None:
-        self.details_flag.set_text(flag_emoji(server.country_code) or "🌐")
+        self.details_flag.set_text(flag_text(server.country_code))
         self.details_country.set_text(_("{country} relay").format(
             country=server.country or "?"))
         host = server.hostname or server.ip
@@ -1093,15 +1086,13 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self.detail_values[key].set_text(value)
 
         protocols = [p.value for p in server.protocols]
-        remembered = self._protocol_choice.get(host, "sslvp")
+        remembered = self._protocol_choice.get(host, DEFAULT_PROTOCOL)
         fallback = remembered if remembered in protocols \
             else (protocols[0] if protocols else "")
         self.details_proto.set_options(
             protocols, labels={p: protocol_name(p) for p in protocols})
         self.details_proto.set_active(fallback)
         self._update_port_hint(server)
-        self.details_connect.set_sensitive(
-            self.state in ("idle", "error") and bool(protocols))
 
     def _update_port_hint(self, server: VpnServer) -> None:
         chosen = self.details_proto.get_active()
@@ -1156,9 +1147,9 @@ class VpnGateWindow(Adw.ApplicationWindow):
         server = self.selected or self.recommended
         hostname = server.hostname or server.ip
         try:
-            protocol = Protocol(self._protocol_choice.get(hostname, "sslvp"))
+            protocol = Protocol(self._protocol_choice.get(hostname, DEFAULT_PROTOCOL))
         except ValueError:
-            protocol = Protocol.SSLVP
+            protocol = Protocol.SSTP if sys.platform == "win32" else Protocol.SSLVP
         if not server.supports(protocol):
             if server.protocols:
                 protocol = server.protocols[0]
@@ -1170,17 +1161,8 @@ class VpnGateWindow(Adw.ApplicationWindow):
     def _on_quick_connect(self, _button, server: VpnServer) -> None:
         if not self._can_connect():
             return
-        self._connect(server, Protocol.SSLVP)
-
-    def _on_details_connect(self, *args) -> None:      # noqa: ANN001
-        if self.state not in ("idle", "error") or self.selected is None:
-            return
-        chosen = self.details_proto.get_active()
-        try:
-            protocol = Protocol(chosen)
-        except ValueError:
-            protocol = self.selected.protocols[0]
-        self._connect(self.selected, protocol)
+        target_proto = Protocol.SSTP if sys.platform == "win32" else Protocol.SSLVP
+        self._connect(server, target_proto)
 
     def act_connect_quick(self) -> None:
         """Connect via selection/recommended; disconnect when connected."""
@@ -1598,9 +1580,6 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self.connect_btn.set_sensitive(self._can_connect())
         self.header_spinner.set_visible(
             self.state in ("connecting", "authorizing"))
-        self.details_connect.set_sensitive(
-            self._can_connect() and self.selected is not None
-            and bool(self.selected.protocols))
         if self.tray is not None:
             self.tray.set_state(self.state or "idle")
             self.tray.set_menu(
@@ -1616,7 +1595,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         dialog.props.title = _("Settings")
         dialog.add(self._appearance_page())
         dialog.add(self._mirrors_page(dialog))
-        dialog.add(self._support_page())
+        dialog.add(self._support_page(dialog))
         dialog.props.search_enabled = False
         dialog.present(self)
 
@@ -1642,31 +1621,6 @@ class VpnGateWindow(Adw.ApplicationWindow):
         row.connect("notify::selected", changed)
         group.add(row)
         page.add(group)
-
-        layout_group = Adw.PreferencesGroup(
-            title=_("Text direction"),
-            description=_("Useful when reading RTL languages like Persian"))
-        directions = [_("Follow language"), _("Left to right"),
-                      _("Right to left")]
-        layout_map = ["auto", "ltr", "rtl"]
-        layout_row = Adw.ComboRow(
-            title=_("Interface direction"),
-            model=Gtk.StringList.new(directions))
-        saved = self.settings.get("layout-direction", "auto")
-        layout_row.set_selected(layout_map.index(saved)
-                                if saved in layout_map else 0)
-
-        def direction_changed(combo: Adw.ComboRow, _param) -> None:
-            value = layout_map[combo.get_selected()]
-            self.settings["layout-direction"] = value
-            save_settings(self.settings)
-            mapping = {"auto": Gtk.TextDirection.NONE,
-                       "ltr": Gtk.TextDirection.LTR,
-                       "rtl": Gtk.TextDirection.RTL}
-            Gtk.Widget.set_default_direction(mapping[value])
-        layout_row.connect("notify::selected", direction_changed)
-        layout_group.add(layout_row)
-        page.add(layout_group)
         return page
 
     def _mirrors_page(self, dialog: Optional[Adw.PreferencesDialog] = None) -> Adw.PreferencesPage:
@@ -1751,7 +1705,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         page.add(reset_group)
         return page
 
-    def _support_page(self) -> Adw.PreferencesPage:
+    def _support_page(self, dialog: Optional[Adw.PreferencesDialog] = None) -> Adw.PreferencesPage:
         """The "Buy me a coffee" page: wallet addresses with copy buttons."""
         page = Adw.PreferencesPage(title=_("Buy me a coffee"),
                                    icon_name="star-symbolic")
@@ -1773,7 +1727,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
                                       css_classes=["flat", "circular"],
                                       valign=Gtk.Align.CENTER)
                 copy_btn.connect("clicked",
-                                 self._copy_donation_address, address)
+                                 self._copy_donation_address, address, dialog)
                 row.add_suffix(copy_btn)
             else:
                 row = Adw.ActionRow(
@@ -1784,9 +1738,14 @@ class VpnGateWindow(Adw.ApplicationWindow):
         page.add(group)
         return page
 
-    def _copy_donation_address(self, _button, address: str) -> None:
+    def _copy_donation_address(self, _button, address: str,
+                               dialog: Optional[Adw.PreferencesDialog] = None) -> None:
         self.copy_to_clipboard(address)
-        self.toast(_("Address copied to the clipboard"))
+        toast = Adw.Toast.new(_("Address copied to the clipboard"))
+        if dialog is not None and hasattr(dialog, "add_toast"):
+            dialog.add_toast(toast)
+        else:
+            self.toast(_("Address copied to the clipboard"))
 
     def _fill_mirror_rows(self) -> None:
         """Rebuild the mirror ActionRows for the active preferences dialog."""
@@ -1888,20 +1847,6 @@ class VpnGateWindow(Adw.ApplicationWindow):
             "L2TP / MS-SSTP / OpenVPN) with a premium UX.")
         dialog.props.license_type = Gtk.License.MIT_X11
         dialog.props.developers = [DEVELOPER_NAME]
-        donations = [
-            ("Bitcoin", DONATE_BITCOIN),
-            ("Ethereum", DONATE_ETHEREUM),
-            ("BEP20 (BNB Smart Chain)", DONATE_BEP20),
-        ]
-        filled = [f"{label}: {address}" for label, address in donations
-                  if address]
-        if filled:
-            dialog.props.comments = dialog.props.comments + "\n\n☕ " + _(
-                "Buy me a coffee:") + "\n" + "\n".join(filled)
-        else:
-            dialog.props.comments = dialog.props.comments + "\n\n☕ " + _(
-                "Buy me a coffee — wallet addresses are set in "
-                "app/vpngate/config.py (DONATE_*).")
         dialog.present(self)
 
     # ==================================================================

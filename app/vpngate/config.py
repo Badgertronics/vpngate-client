@@ -3,7 +3,7 @@ import sys
 
 APP_NAME = "VPN Gate Client"
 APP_ID = "com.vpngate.client"
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 # ---------------------------------------------------------------------------
 # Paths

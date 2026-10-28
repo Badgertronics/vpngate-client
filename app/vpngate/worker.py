@@ -73,8 +73,20 @@ class Worker:
             _emit({"event": "error", "message": "No backend for this protocol."})
             return
         if not backend.available():
-            _emit({"event": "error",
-                   "message": f"The {backend.name} client is not installed."})
+            if sys.platform == "win32":
+                if protocol == Protocol.OPENVPN:
+                    msg = ("The OpenVPN client is not installed on this PC. "
+                           "Please select MS-SSTP or L2TP/IPsec (built into Windows), "
+                           "or install OpenVPN from https://openvpn.net")
+                elif protocol == Protocol.SSLVP:
+                    msg = ("The SSL-VPN (SoftEther) client is not installed on this PC. "
+                           "Please select MS-SSTP or L2TP/IPsec (built into Windows), "
+                           "or install SoftEther from https://www.vpngate.net")
+                else:
+                    msg = f"The {backend.name} client is not installed."
+            else:
+                msg = f"The {backend.name} client is not installed."
+            _emit({"event": "error", "message": msg})
             return
 
         server = self._server_from(command.get("server", {}))

@@ -79,9 +79,12 @@ def is_root() -> bool:
 
 
 def _spawn(args: Tuple[str, ...], env: dict) -> subprocess.Popen:
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     return subprocess.Popen(
         args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, text=True, bufsize=1, env=env, cwd=BASE_DIR)
+        stderr=subprocess.PIPE, text=True, bufsize=1, env=env, cwd=BASE_DIR, **kwargs)
 
 
 def _drained_stderr(proc: subprocess.Popen) -> str:
