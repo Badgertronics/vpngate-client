@@ -12,50 +12,6 @@ JSON lines over stdin/stdout, so the desktop application itself stays
 unprivileged and the user is asked for administrative rights only once, via
 `pkexec` (polkit) with a `sudo` fallback.
 
-## Features
-
-- **Daily server list** from the official mirror sites (editable in the
-  GUI's settings dialog) plus a **censor-resistant fallback chain**:
-  the fresh daily mirror list from this very repository's
-  [`data/mirrors.json`](data/mirrors.json) (refreshed every day by a
-  scheduled GitHub Action), then the committed
-  [`data/servers.csv`](data/servers.csv) copy of the official API, then
-  hourly CSV snapshots of the official API republished on the jsDelivr CDN
-  (`vpngate-list-mirror`). You can run the client even when the VPN Gate
-  mirrors themselves are being blocked; a banner tells you when a snapshot
-  is in use.
-- **Premium GTK4 client UI** (rewritten from scratch in 2026, see "Why GTK4 +
-  libadwaita" below):
-  - hero connection panel with an **animated status ring** that moves
-    through idle → authorizing → connecting states, flashes a green check
-    pulse when the tunnel is up and turns red on errors;
-  - server browser with **flag emoji, protocol chips, colour-coded ping
-    badges, mini speed bars**, search (debounced), country filter and live
-    sorting by recommendation / speed / latency / country;
-  - "Recommended" strip for **one-click connects** (SSL-VPN relays in
-    JP/KR/TH are preferred, then the highest score);
-  - details side panel (operator, logging policy, traffic, ISP …) with a
-    per-server **protocol selector and port hint**;
-  - a **terminal-style log drawer** on a libadwaita BottomSheet (coloured
-    levels, follow-tail, copy-all, Ctrl+L/Esc);
-  - toasts + banners for offline / CDN-fallback / rejected-password /
-    helper-failed states, loading skeletons, and a first-run empty state;
-  - dark / light / follow-system theme switch, RTL layout override
-    (Persian, Arabic …), keyboard shortcuts (Ctrl+R refresh, Ctrl+F search,
-    Ctrl+L log, Ctrl+Enter connect, Esc), tooltips, HiDPI-crisp rendering,
-    reduce-motion support, optional **tray icon** (a tiny isolated helper
-    process - a tray crash can never take the GUI down).
-- **One-click connect** with per-protocol wizardry handled by the backends:
-  - SSL-VPN: manages a fresh SoftEther `vpnclient` daemon every dial (TUN
-    module, virtual adapter lifecycle, DHCP then `resolvectl` DNS,
-    policy-routing default route with the physical setup kept intact).
-  - L2TP/IPsec: strongSwan IKEv1 + xl2tpd + `pppd`, including the
-    **ESP-in-UDP checksum fixer** (NFQUEUE) that repairs datagrams mangled by
-    cheap SOHO routers.
-  - MS-SSTP: direct HTTPS L2TP-style dial via `sstpc` + `pppd`.
-- Clean disconnect path: routes, DNS leases, virtual adapters, accounts and
-  daemons are restored to their prior state.
-
 ## Protocol status (practically, in 2026)
 
 | Protocol    | Status                                                      |
