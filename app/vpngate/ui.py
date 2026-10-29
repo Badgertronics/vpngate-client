@@ -597,35 +597,46 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self.quick_strip.append(button)
 
     def _build_filters(self) -> Gtk.Widget:
-        self.filters = _make_wrap_box(child_spacing=8, line_spacing=8,
-                                      valign=Gtk.Align.CENTER)
+        self.filters = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+
+        row_top = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.search = Gtk.SearchEntry(
-            hexpand=True, halign=Gtk.Align.FILL, max_width_chars=40,
+            hexpand=True, halign=Gtk.Align.FILL, max_width_chars=36,
             placeholder_text=_("Search country, host or IP … (Ctrl+F)"))
         self.search.connect("search-changed", self._on_search_changed)
-        self.filters.append(self.search)
+        row_top.append(self.search)
 
         self.country_model = Gtk.StringList.new([_("All countries")])
         self.country_dd = Gtk.DropDown.new(self.country_model, None)
         self.country_dd.connect("notify::selected-item",
                                 lambda *_: self._apply_filters())
-        self.filters.append(self.country_dd)
+        row_top.append(self.country_dd)
 
         sort_items = [_("Recommended"), _("Fastest"), _("Lowest latency"),
                       _("Country")]
         self.sort_dd = Gtk.DropDown.new(Gtk.StringList.new(sort_items), None)
         self.sort_dd.set_selected(0)
         self.sort_dd.connect("notify::selected-item", self._on_sort_changed)
-        self.filters.append(self.sort_dd)
+        row_top.append(self.sort_dd)
+        self.filters.append(row_top)
 
+        row_bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.proto_seg = Segmented()
+        proto_labels = {
+            "all": _("All"),
+            "sslvp": "SSL-VPN",
+            "l2tp": "L2TP/IPsec",
+            "sstp": "MS-SSTP",
+            "openvpn": "OpenVPN",
+        }
         self.proto_seg.set_options(
             ["all", "sslvp", "l2tp", "sstp", "openvpn"],
-            labels={"all": _("All"),
-                    **{p.value: protocol_name(p.value) for p in PROTOCOL_ORDER}})
+            labels=proto_labels)
         self.proto_seg.set_active("all")
         self.proto_seg.connect("changed", lambda _seg, _v: self._apply_filters())
-        self.filters.append(self.proto_seg)
+        row_bottom.append(self.proto_seg)
+        self.filters.append(row_bottom)
+
         return self.filters
 
     def _on_sort_changed(self, dropdown: Gtk.DropDown, _param) -> None:

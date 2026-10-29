@@ -210,7 +210,7 @@ def package_deb(source_dir: Path, output_deb: Path, deb_arch: str) -> None:
     sudoers_file = install_sudoers / "vpngate-client"
     sudoers_file.write_text(
         "# Allow running the VPN Gate worker without password prompt\n"
-        "ALL ALL=(ALL) NOPASSWD: /usr/lib/vpngate-client/vpngate-worker, /usr/bin/vpngate-gui\n",
+        "ALL ALL=(ALL) NOPASSWD: /usr/lib/vpngate-client/vpngate-worker, /usr/bin/vpngate-worker, /usr/bin/vpngate-gui\n",
         encoding="utf-8"
     )
     sudoers_file.chmod(0o440)
@@ -287,12 +287,13 @@ def package_deb(source_dir: Path, output_deb: Path, deb_arch: str) -> None:
         encoding="utf-8"
     )
 
-    # postinst script to ensure proper sudoers file permission
+    # postinst script to ensure proper sudoers file permission and ownership
     postinst_file = debian_dir / "postinst"
     postinst_file.write_text(
         "#!/bin/sh\n"
         "set -e\n"
         "if [ -f /etc/sudoers.d/vpngate-client ]; then\n"
+        "    chown root:root /etc/sudoers.d/vpngate-client\n"
         "    chmod 0440 /etc/sudoers.d/vpngate-client\n"
         "fi\n"
         "exit 0\n",
@@ -300,7 +301,7 @@ def package_deb(source_dir: Path, output_deb: Path, deb_arch: str) -> None:
     )
     postinst_file.chmod(0o755)
 
-    run([dpkg_deb, "--build", str(deb_root), str(output_deb)])
+    run([dpkg_deb, "--build", "--root-owner-group", str(deb_root), str(output_deb)])
     shutil.rmtree(deb_root, ignore_errors=True)
     print(f"==> Successfully generated {output_deb}")
 

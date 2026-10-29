@@ -49,10 +49,11 @@ def _env() -> dict:
 
 def worker_command() -> Tuple[str, ...]:
     for candidate_name in ("vpngate-worker", "vpngate-worker.exe"):
-        for directory in (BASE_DIR, os.path.dirname(sys.executable)):
+        for directory in ("/usr/lib/vpngate-client", BASE_DIR, os.path.dirname(sys.executable),
+                          "/usr/local/bin", "/usr/bin"):
             candidate = os.path.join(directory, candidate_name)
             if os.path.isfile(candidate) and (os.access(candidate, os.X_OK) or sys.platform == "win32"):
-                return (candidate,)
+                return (os.path.realpath(candidate),)
     if not getattr(sys, "frozen", False):
         python = shutil.which("python3") or shutil.which("python") or sys.executable
     else:
@@ -71,6 +72,15 @@ def has_sudo() -> bool:
 def has_passwordless_sudo() -> bool:
     if not shutil.which("sudo"):
         return False
+    # Test worker command with input="" so even if --check is unrecognized,
+    # the worker exits cleanly on stdin EOF without hanging.
+    cmd = list(worker_command()) + ["--check"]
+    try:
+        res = subprocess.run(["sudo", "-n"] + cmd, input="", text=True, capture_output=True, timeout=2)
+        if res.returncode == 0:
+            return True
+    except Exception:
+        pass
     try:
         res = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=2)
         return res.returncode == 0

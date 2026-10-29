@@ -190,6 +190,8 @@ def _jsonable(info: dict) -> dict:
 
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] in ("--check", "-c"):
+        sys.exit(0)
     worker = Worker()
     uid = getattr(os, "getuid", lambda: 0)()
     _emit({"event": "ready", "uid": uid})
