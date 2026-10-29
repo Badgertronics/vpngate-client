@@ -177,33 +177,61 @@ def quick_stack(servers: List[VpnServer], limit: int = 3) -> List[VpnServer]:
     return picks[:limit]
 
 
-def probe_target(target: str, timeout: float = 2.0) -> bool:
+def probe_target(target: str, timeout: float = 3.0) -> bool:
     target = (target or "").strip()
     if not target:
         return False
-    try:
-        if ":" in target and not target.startswith("http"):
+    import ssl
+    import urllib.request
+
+    # 1. Explicit HTTP / HTTPS URL
+    if target.startswith("http://") or target.startswith("https://"):
+        try:
+            req = urllib.request.Request(target, headers={"User-Agent": "Mozilla/5.0"})
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                return resp.status < 500
+        except Exception:
+            return False
+
+    # 2. host:port specified
+    if ":" in target:
+        try:
             host, port_s = target.split(":", 1)
             port = int(port_s)
-        elif target.startswith("http://") or target.startswith("https://"):
-            from urllib.parse import urlparse
-            parsed = urlparse(target)
-            host = parsed.hostname or target
-            port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        else:
-            host = target
-            port = 53
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except Exception:
+            return False
+
+    # 3. Numeric IPv4 address (e.g. 1.1.1.1, 8.8.8.8)
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", target):
+        try:
+            with socket.create_connection((target, 53), timeout=timeout):
+                return True
+        except Exception:
+            try:
+                with socket.create_connection((target, 443), timeout=timeout):
+                    return True
+            except Exception:
+                return False
+
+    # 4. Hostname (e.g. youtube.com, google.com, cloudflare.com)
+    # Perform strict HTTPS probe with SSL verification so DPI/censorship proxies cannot fake it
+    try:
+        url = f"https://{target}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+            return resp.status < 500
     except Exception:
-        if not target.startswith("http") and ":" not in target:
-            for p in (80, 443):
-                try:
-                    with socket.create_connection((target, p), timeout=timeout):
-                        return True
-                except Exception:
-                    pass
-    return False
+        try:
+            url = f"http://{target}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status < 500
+        except Exception:
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -1551,6 +1579,22 @@ class VpnGateWindow(Adw.ApplicationWindow):
             minutes, seconds = divmod(rest, 60)
             self.chip_uptime.set_label(_("Up {t}").format(
                 t=f"{hours:02d}:{minutes:02d}:{seconds:02d}"))
+
+            # Fast check on Windows if native RAS connection dropped
+            win_vpn = self.connected_info.get("windows_vpn")
+            if win_vpn and sys.platform == "win32":
+                try:
+                    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    proc_check = subprocess.run(["rasdial"], capture_output=True, text=True,
+                                                timeout=2, creationflags=creation_flags)
+                    if win_vpn.lower() not in proc_check.stdout.lower():
+                        self._append_log(_("Windows connection {vpn} dropped.").format(vpn=win_vpn))
+                        self.toast(_("Windows connection {vpn} dropped.").format(vpn=win_vpn))
+                        self._handle_state({"state": "disconnected"})
+                        self._send({"cmd": "disconnect"})
+                        return True
+                except Exception:
+                    pass
 
             now = time.time()
             if not self._watchdog_in_flight and (now - self._watchdog_last_check) >= 4.0:

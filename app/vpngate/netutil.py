@@ -135,6 +135,35 @@ def default_routes() -> List[Tuple[str, str, int]]:
     return routes
 
 
+def windows_physical_gateway() -> str:
+    """Find the IPv4 gateway of the underlying physical network connection on Windows."""
+    if sys.platform != "win32":
+        return ""
+    # 1. First check if default_routes() has a non-virtual/non-VPN gateway
+    for gw, _iface, _metric in default_routes():
+        if gw and gw != "0.0.0.0" and not gw.startswith("10.211.") and not gw.startswith("10.8.") and not gw.startswith("169.254."):
+            return gw
+    # 2. Check route print for any gateway used on physical LANs
+    code, out, _ = run(["route", "print"])
+    if code == 0:
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[1] == "255.255.255.255":
+                gw = parts[2]
+                if (gw.startswith("192.168.") or gw.startswith("10.") or gw.startswith("172.")) and not gw.startswith("10.211."):
+                    return gw
+    # 3. Check ipconfig for IPv4 Address and derive .1 gateway
+    code, out, _ = run(["ipconfig"])
+    if code == 0:
+        for line in out.splitlines():
+            m = re.search(r"IPv4 Address[ .:]+:\s*(\d+\.\d+\.\d+)\.\d+", line)
+            if m:
+                prefix = m.group(1)
+                if not prefix.startswith("10.211.") and not prefix.startswith("169.254."):
+                    return f"{prefix}.1"
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Route manipulation
 # ---------------------------------------------------------------------------

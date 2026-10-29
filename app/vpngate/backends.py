@@ -13,8 +13,10 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
+import threading
 import time
 from typing import Callable, Dict, List, Optional
 
@@ -80,12 +82,14 @@ class OpenVpnBackend:
     @staticmethod
     def _openvpn_bin() -> str:
         if sys.platform == "win32":
+            for p in (r"C:\Program Files\OpenVPN\bin\openvpn.exe",
+                      r"C:\Program Files (x86)\OpenVPN\bin\openvpn.exe"):
+                if os.path.exists(p):
+                    return p
             found = shutil.which("openvpn")
             if found:
                 return found
-            for p in (r"C:\Program Files\OpenVPN\bin\openvpn.exe",
-                      r"C:\Program Files (x86)\OpenVPN\bin\openvpn.exe",
-                      r"C:\Program Files\OpenVPN Connect\OpenVPNConnect.exe",
+            for p in (r"C:\Program Files\OpenVPN Connect\OpenVPNConnect.exe",
                       r"C:\Program Files (x86)\OpenVPN Connect\OpenVPNConnect.exe"):
                 if os.path.exists(p):
                     return p
@@ -192,14 +196,17 @@ class OpenVpnBackend:
             # Pin TLS 1.2: newer OpenVPN clients send a 1.5 kB ClientHello
             # which the SoftEther based relay servers cannot parse.
             "--tls-version-min", "1.2", "--tls-version-max", "1.2",
+            "--data-ciphers", "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-128-CBC:AES-256-CBC",
+            "--data-ciphers-fallback", "AES-128-CBC",
             "--verb", "3",
         ]
         started = time.monotonic()
         _log_emit(emit, f"Starting OpenVPN ({'UDP' if server.openvpn_udp else 'TCP'} "
                         f"{server.port_for(Protocol.OPENVPN)}) -> {server.ip}")
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True,
-                                bufsize=1)
+                                bufsize=1, creationflags=creation_flags)
         deadline = time.time() + CONNECT_TIMEOUT
         connected = False
         lines: List[str] = []
@@ -227,17 +234,40 @@ class OpenVpnBackend:
             raise BackendError(
                 "The OpenVPN connection did not complete in time.\n" + tail)
 
-        iface = self._tun_interface()
-        ip = netutil.interface_ipv4(iface) if iface else ""
-        gateway = netutil.route_via(iface) if iface else None
-        if not gateway:
-            # The server did not push a default route, install one ourselves.
-            gateway = self._fallback_gateway(iface)
-            if gateway:
-                _log_emit(emit, f"Installing the default route via {gateway} "
-                                f"on {iface} ...")
-                netutil.install_tunnel_default(gateway, iface, server.ip,
-                                               self._physical_gateway())
+        def _drain_stdout() -> None:
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        _log_emit(emit, line)
+            except Exception:
+                pass
+
+        threading.Thread(target=_drain_stdout, daemon=True).start()
+
+        if sys.platform == "win32":
+            iface = "OpenVPN TAP/DCO"
+            assigned_ip = server.ip
+            for l in reversed(lines):
+                m = re.search(r"(?:local|IP/netmask of|ip_addr=)\s*(\d+\.\d+\.\d+\.\d+)", l)
+                if m:
+                    assigned_ip = m.group(1)
+                    break
+            ip = assigned_ip
+            gateway = server.ip
+        else:
+            iface = self._tun_interface()
+            ip = netutil.interface_ipv4(iface) if iface else ""
+            gateway = netutil.route_via(iface) if iface else None
+            if not gateway:
+                # The server did not push a default route, install one ourselves.
+                gateway = self._fallback_gateway(iface)
+                if gateway:
+                    _log_emit(emit, f"Installing the default route via {gateway} "
+                                    f"on {iface} ...")
+                    netutil.install_tunnel_default(gateway, iface, server.ip,
+                                                   self._physical_gateway())
         _log_emit(emit, f"OpenVPN connected in {_since(started)}: {iface} "
                         f"has {ip or '?'}, gateway {gateway or '?'}")
         return {
@@ -369,8 +399,14 @@ class OpenVpnBackend:
     @staticmethod
     def _terminate(proc) -> None:
         try:
-            proc.terminate()
-            proc.wait(timeout=10)
+            if sys.platform == "win32":
+                creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                               capture_output=True, timeout=5,
+                               creationflags=creation_flags)
+            else:
+                proc.terminate()
+                proc.wait(timeout=10)
         except Exception:                          # noqa: BLE001
             try:
                 proc.kill()
@@ -859,6 +895,23 @@ class SstpBackend:
             raise BackendError(f"Failed to create Windows VPN profile for MS-SSTP: {err}")
         self._configure_windows_vpn_pbk(vpn_name)
 
+        # Add static host route to server IP via physical gateway to prevent route loops
+        physical_gw = netutil.windows_physical_gateway()
+        target_ips = set()
+        if server.ip:
+            target_ips.add(server.ip)
+        try:
+            resolved = socket.gethostbyname(host)
+            if resolved:
+                target_ips.add(resolved)
+        except Exception:
+            pass
+        if physical_gw and target_ips:
+            for tip in target_ips:
+                _log_emit(emit, f"[sstp] Routing {tip}/32 via physical gateway {physical_gw} ...")
+                subprocess.run(["route", "add", tip, "mask", "255.255.255.255", physical_gw, "metric", "1"],
+                               capture_output=True, text=True, timeout=10)
+
         _log_emit(emit, f"[sstp 2/3] Dialing {vpn_name} ({host}) via Windows RAS ...")
         dial_res = subprocess.run(
             ["rasdial", vpn_name, VPN_USERNAME, VPN_PASSWORD],
@@ -876,6 +929,8 @@ class SstpBackend:
             subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
                             f"Remove-VpnConnection -Name '{vpn_name}' -Force -ErrorAction SilentlyContinue"],
                            capture_output=True, text=True, timeout=10)
+            for tip in target_ips:
+                subprocess.run(["route", "delete", tip], capture_output=True, text=True, timeout=5)
             last_line = output.strip().splitlines()[-1] if output.strip() else "connection failed"
             raise BackendError(f"MS-SSTP connection failed: {last_line}")
 
@@ -893,6 +948,7 @@ class SstpBackend:
             "gateway": host,
             "detail": {"vpn_name": vpn_name, "host": host},
             "windows_vpn": vpn_name,
+            "target_ips": list(target_ips),
         }
 
     def _write_ppp_options(self, workdir: str) -> str:
@@ -1022,6 +1078,11 @@ class SstpBackend:
     def disconnect(self, info: dict, emit: Emit) -> None:
         if sys.platform == "win32":
             vpn_name = info.get("windows_vpn") or "VPNGate"
+            target_ips = info.get("target_ips") or []
+            if not target_ips and info.get("ip"):
+                target_ips = [info["ip"]]
+            for tip in target_ips:
+                subprocess.run(["route", "delete", tip], capture_output=True, text=True, timeout=10)
             _log_emit(emit, f"[sstp] Disconnecting Windows RAS connection {vpn_name} ...")
             subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
                            capture_output=True, text=True, timeout=15)
@@ -1104,6 +1165,23 @@ class L2tpBackend:
             raise BackendError(f"Failed to create Windows VPN profile for L2TP/IPsec: {err}")
         SstpBackend._configure_windows_vpn_pbk(vpn_name)
 
+        # Add static host route to server IP via physical gateway to prevent route loops
+        physical_gw = netutil.windows_physical_gateway()
+        target_ips = set()
+        if server.ip:
+            target_ips.add(server.ip)
+        try:
+            resolved = socket.gethostbyname(host)
+            if resolved:
+                target_ips.add(resolved)
+        except Exception:
+            pass
+        if physical_gw and target_ips:
+            for tip in target_ips:
+                _log_emit(emit, f"[l2tp] Routing {tip}/32 via physical gateway {physical_gw} ...")
+                subprocess.run(["route", "add", tip, "mask", "255.255.255.255", physical_gw, "metric", "1"],
+                               capture_output=True, text=True, timeout=10)
+
         _log_emit(emit, f"[l2tp 2/3] Dialing {vpn_name} ({host}) via Windows RAS with PSK ...")
         dial_res = subprocess.run(
             ["rasdial", vpn_name, VPN_USERNAME, VPN_PASSWORD],
@@ -1121,6 +1199,8 @@ class L2tpBackend:
             subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
                             f"Remove-VpnConnection -Name '{vpn_name}' -Force -ErrorAction SilentlyContinue"],
                            capture_output=True, text=True, timeout=10)
+            for tip in target_ips:
+                subprocess.run(["route", "delete", tip], capture_output=True, text=True, timeout=5)
             last_line = output.strip().splitlines()[-1] if output.strip() else "connection failed"
             raise BackendError(f"L2TP/IPsec connection failed: {last_line}")
 
@@ -1139,6 +1219,7 @@ class L2tpBackend:
             "gateway": host,
             "detail": {"vpn_name": vpn_name, "host": host},
             "windows_vpn": vpn_name,
+            "target_ips": list(target_ips),
         }
 
     # -- inbound UDP-checksum workaround -------------------------------------
@@ -1475,6 +1556,11 @@ class L2tpBackend:
     def disconnect(self, info: dict, emit: Emit) -> None:
         if sys.platform == "win32":
             vpn_name = info.get("windows_vpn") or "VPNGate"
+            target_ips = info.get("target_ips") or []
+            if not target_ips and info.get("ip"):
+                target_ips = [info["ip"]]
+            for tip in target_ips:
+                subprocess.run(["route", "delete", tip], capture_output=True, text=True, timeout=10)
             _log_emit(emit, f"[l2tp] Disconnecting Windows RAS connection {vpn_name} ...")
             subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
                            capture_output=True, text=True, timeout=15)
