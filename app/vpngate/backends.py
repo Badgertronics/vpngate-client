@@ -74,13 +74,19 @@ class OpenVpnBackend:
         return bool(netutil.which("openvpn"))
 
     @staticmethod
+    def _is_connect(bin_path: str) -> bool:
+        return bool(bin_path and bin_path.lower().endswith("openvpnconnect.exe"))
+
+    @staticmethod
     def _openvpn_bin() -> str:
         if sys.platform == "win32":
             found = shutil.which("openvpn")
             if found:
                 return found
             for p in (r"C:\Program Files\OpenVPN\bin\openvpn.exe",
-                      r"C:\Program Files (x86)\OpenVPN\bin\openvpn.exe"):
+                      r"C:\Program Files (x86)\OpenVPN\bin\openvpn.exe",
+                      r"C:\Program Files\OpenVPN Connect\OpenVPNConnect.exe",
+                      r"C:\Program Files (x86)\OpenVPN Connect\OpenVPNConnect.exe"):
                 if os.path.exists(p):
                     return p
             return ""
@@ -173,7 +179,12 @@ class OpenVpnBackend:
     # -- connect / disconnect --------------------------------------------
     def connect(self, server: VpnServer, protocol: Protocol, emit: Emit,
                 workdir: str) -> dict:
+        config = self.build_config(server, workdir, emit)
         openvpn_bin = self._openvpn_bin() or "openvpn"
+        if sys.platform == "win32" and self._is_connect(openvpn_bin):
+            return self._connect_openvpn_connect(server, protocol, emit, workdir,
+                                                 config, openvpn_bin)
+
         cmd = [
             openvpn_bin, "--config", config,
             # Pin TLS 1.2: newer OpenVPN clients send a 1.5 kB ClientHello
@@ -239,6 +250,95 @@ class OpenVpnBackend:
             "process": proc,
         }
 
+    def _connect_openvpn_connect(self, server: VpnServer, protocol: Protocol,
+                                 emit: Emit, workdir: str, config: str,
+                                 openvpn_bin: str) -> dict:
+        started = time.monotonic()
+        _log_emit(emit, f"Importing OpenVPN profile into OpenVPN Connect for {server.hostname or server.ip} ...")
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        proc = subprocess.run(
+            [openvpn_bin, f"--import-profile={config}", "--name=VPNGate_Tunnel",
+             f"--username={VPN_USERNAME}", f"--password={VPN_PASSWORD}"],
+            capture_output=True, text=True, timeout=25, check=False,
+            creationflags=creation_flags
+        )
+        profile_id = ""
+        try:
+            data = json.loads(proc.stdout)
+            if data.get("status") == "success":
+                profile_id = data.get("message", {}).get("id", "")
+        except Exception:
+            pass
+
+        if not profile_id:
+            proc_list = subprocess.run(
+                [openvpn_bin, "--list-profiles"],
+                capture_output=True, text=True, timeout=15, check=False,
+                creationflags=creation_flags
+            )
+            try:
+                profiles = json.loads(proc_list.stdout)
+                for p in profiles:
+                    if p.get("name") == "VPNGate_Tunnel":
+                        profile_id = p.get("id", "")
+                        break
+            except Exception:
+                pass
+
+        if not profile_id:
+            raise BackendError("OpenVPN Connect could not import the server profile.")
+
+        _log_emit(emit, "Starting OpenVPN Connect tunnel ...")
+        subprocess.run(
+            [openvpn_bin, f"--connect-shortcut={profile_id}", "--minimize"],
+            capture_output=True, text=True, timeout=15, check=False,
+            creationflags=creation_flags
+        )
+
+        deadline = time.time() + CONNECT_TIMEOUT
+        ip = ""
+        while time.time() < deadline:
+            time.sleep(2)
+            proc_ip = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-NetIPAddress -InterfaceDescription '*OpenVPN*' -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '169.254.*' }).IPAddress"],
+                capture_output=True, text=True, timeout=10, check=False,
+                creationflags=creation_flags
+            )
+            lines = proc_ip.stdout.strip().splitlines()
+            if lines and lines[0].strip():
+                ip = lines[0].strip()
+                break
+
+        if not ip:
+            proc_ip = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-NetIPAddress -InterfaceAlias '*Local Area Connection*' -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '169.254.*' }).IPAddress"],
+                capture_output=True, text=True, timeout=10, check=False,
+                creationflags=creation_flags
+            )
+            lines = proc_ip.stdout.strip().splitlines()
+            if lines and lines[0].strip():
+                ip = lines[0].strip()
+
+        if not ip:
+            subprocess.run([openvpn_bin, "--disconnect-shortcut"], check=False,
+                           creationflags=creation_flags)
+            subprocess.run([openvpn_bin, f"--remove-profile={profile_id}"], check=False,
+                           creationflags=creation_flags)
+            raise BackendError("The OpenVPN Connect tunnel did not establish in time.")
+
+        _log_emit(emit, f"OpenVPN Connect established in {_since(started)}: adapter carries {ip}")
+        self._last_openvpn_connect_id = profile_id
+        return {
+            "protocol": protocol.value,
+            "server": f"{server.hostname} ({server.ip})",
+            "interface": "OpenVPN Connect",
+            "ip": ip,
+            "gateway": server.ip,
+            "detail": {"profile_id": profile_id, "bin": openvpn_bin, "is_connect": True},
+        }
+
     @staticmethod
     def _tun_interface() -> str:
         for name in netutil.list_tunnel_interfaces():
@@ -276,6 +376,19 @@ class OpenVpnBackend:
                 pass
 
     def disconnect(self, info: dict, emit: Emit) -> None:
+        detail = info.get("detail") if isinstance(info.get("detail"), dict) else {}
+        openvpn_bin = detail.get("bin") or self._openvpn_bin()
+        if sys.platform == "win32" and (detail.get("is_connect") or self._is_connect(openvpn_bin)):
+            profile_id = detail.get("profile_id") or getattr(self, "_last_openvpn_connect_id", "")
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.run([openvpn_bin, "--disconnect-shortcut"], check=False,
+                           creationflags=creation_flags)
+            if profile_id:
+                subprocess.run([openvpn_bin, f"--remove-profile={profile_id}"], check=False,
+                               creationflags=creation_flags)
+            _log_emit(emit, "OpenVPN Connect disconnected.")
+            return
+
         proc = info.get("process")
         if proc is not None:
             _log_emit(emit, "Terminating the OpenVPN process ...")
@@ -422,6 +535,9 @@ class SoftEtherBackend:
 
     def connect(self, server: VpnServer, protocol: Protocol, emit: Emit,
                 workdir: str) -> dict:
+        if sys.platform == "win32":
+            return self._connect_windows(server, protocol, emit, workdir)
+
         port = server.ssl_vpn_port
         if not port:
             raise BackendError("This server does not offer the SSL-VPN service.")
@@ -573,7 +689,84 @@ class SoftEtherBackend:
             return status or "connected", True
         return status, False
 
+    def _connect_windows(self, server: VpnServer, protocol: Protocol, emit: Emit,
+                         workdir: str) -> dict:
+        port = server.ssl_vpn_port
+        if not port:
+            raise BackendError("This server does not offer the SSL-VPN service.")
+        host = server.hostname or server.ip
+        target = f"{host}:{port}"
+        started = time.monotonic()
+        _log_emit(emit, f"[sslvpn] Starting SSL-VPN (SoftEther) -> {target} [hub {SOFTETHER_HUB}, user {VPN_USERNAME}]")
+
+        # Ensure Virtual NIC exists in SoftEther
+        self._run_commands([f"NicCreate {self.NIC}", f"NicEnable {self.NIC}"], timeout=30)
+
+        # Clear any stale vpngate account session and dial
+        commands = [
+            f"AccountDisconnect {self.ACCOUNT}",
+            f"AccountDelete {self.ACCOUNT}",
+            f"AccountCreate {self.ACCOUNT} /SERVER:{target} /HUB:{SOFTETHER_HUB} /USERNAME:{VPN_USERNAME} /NICNAME:{self.NIC}",
+            f"AccountPasswordSet {self.ACCOUNT} /PASSWORD:{VPN_PASSWORD} /TYPE:standard",
+            f"AccountServerCertDisable {self.ACCOUNT}",
+            f"AccountStatusHide {self.ACCOUNT}",
+            f"AccountConnect {self.ACCOUNT}",
+        ]
+        self._run_commands(commands, timeout=40)
+        _log_emit(emit, f"[sslvpn] Dialing {target} ...")
+
+        deadline = time.time() + 35
+        established = False
+        while time.time() < deadline:
+            out = self._run_commands([f"AccountStatusGet {self.ACCOUNT}"], timeout=15)
+            _status, is_connected = self._parse_status(out)
+            if is_connected:
+                established = True
+                break
+            if "Error code: 43" in out:
+                raise BackendError("The SoftEther Virtual Network Adapter is already in use by another VPN connection.")
+            time.sleep(1.5)
+
+        if not established:
+            self._run_commands([f"AccountDisconnect {self.ACCOUNT}"], timeout=20)
+            raise BackendError("The SSL-VPN session was not established in time.")
+
+        _log_emit(emit, f"[sslvpn] Session established in {_since(started)}; waiting for IP address ...")
+
+        ip = ""
+        ip_deadline = time.time() + 15
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        while time.time() < ip_deadline:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-NetIPAddress -InterfaceAlias '*VPN*' -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '169.254.*' }).IPAddress"],
+                capture_output=True, text=True, timeout=10, check=False,
+                creationflags=creation_flags
+            )
+            val = proc.stdout.strip().splitlines()
+            if val and val[0].strip():
+                ip = val[0].strip()
+                break
+            time.sleep(1)
+
+        _log_emit(emit, f"[sslvpn] Connected in {_since(started)}: adapter carries {ip or 'DHCP assigned'}")
+        return {
+            "protocol": protocol.value,
+            "server": f"{server.hostname} ({server.ip})",
+            "interface": "VPN",
+            "ip": ip or target,
+            "gateway": target,
+            "detail": {"account": self.ACCOUNT, "port": port},
+        }
+
     def disconnect(self, info: dict, emit: Emit) -> None:
+        if sys.platform == "win32":
+            _log_emit(emit, "[sslvpn] Closing the SoftEther session ...")
+            self._run_commands([f"AccountDisconnect {self.ACCOUNT}",
+                                f"AccountDelete {self.ACCOUNT}"], timeout=20)
+            _log_emit(emit, "SSL-VPN disconnected.")
+            return
+
         started = time.monotonic()
         _log_emit(emit, "[sslvpn] Closing the SoftEther session ...")
         self._run_commands([f"AccountDisconnect {self.ACCOUNT}"], timeout=60)
@@ -595,6 +788,8 @@ class SoftEtherBackend:
 
 
 def self_cmd() -> str:
+    if sys.platform == "win32":
+        return SoftEtherBackend._vpncmd_bin() or "vpncmd"
     return shutil.which("vpncmd") or "/usr/bin/vpncmd"
 
 

@@ -365,12 +365,12 @@ class VpnGateWindow(Adw.ApplicationWindow):
                        self.auth_banner):
             self.banners.append(banner)
         clip_box.append(self.banners)
-        clip_box.append(self._build_filters())
+        clip_box.append(self._build_hero())
         self.quick_strip = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
                                    spacing=8, visible=False)
         clip_box.append(self.quick_strip)
+        clip_box.append(self._build_filters())
         clip_box.append(self._build_list_stack())
-        clip_box.append(self._build_hero())
 
     def _banner(self, text: str, button_label: Optional[str] = None) -> Adw.Banner:
         banner = Adw.Banner()
@@ -642,7 +642,11 @@ class VpnGateWindow(Adw.ApplicationWindow):
         panel.props.height_request = 260
         head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         head.append(Gtk.Label(label=_("Connection log"), xalign=0,
-                              css_classes=["title-4"], hexpand=True))
+                              css_classes=["title-4"]))
+        self.sheet_pill = Gtk.Label(label="0", css_classes=["chip", "chip-slate"],
+                                    tooltip_text=_("lines in the log"))
+        head.append(self.sheet_pill)
+        head.append(Gtk.Box(hexpand=True))
         self.follow = Gtk.CheckButton(label=_("Follow"), active=True)
         head.append(self.follow)
         copy_btn = Gtk.Button(icon_name="edit-copy-symbolic",
@@ -669,19 +673,6 @@ class VpnGateWindow(Adw.ApplicationWindow):
         scroller.props.vexpand = True
         panel.append(scroller)
         sheet.props.sheet = panel
-
-        bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
-                         margin_start=10, margin_end=10, margin_top=4,
-                         margin_bottom=4)
-        bottom.append(Gtk.Label(label=_("Output"), css_classes=["dim"]))
-        self.sheet_pill = Gtk.Label(label="0", css_classes=["chip", "chip-slate"],
-                                    tooltip_text=_("lines in the log"))
-        bottom.append(self.sheet_pill)
-        bottom.append(Gtk.Box(hexpand=True))
-        bar_btn = Gtk.Button(label=_("Show log"), css_classes=["flat", "pill"])
-        bar_btn.connect("clicked", lambda *_: self._open_sheet())
-        bottom.append(bar_btn)
-        sheet.props.bottom_bar = bottom
 
         for name, color in (("log-error", "#ff6d6d"), ("log-warn", "#f4b661"),
                             ("log-ok", "#7fe0a0"), ("log-head", "#8aa0b4")):
