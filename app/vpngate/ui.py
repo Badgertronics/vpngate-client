@@ -416,7 +416,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self.split = Adw.OverlaySplitView(sidebar_position=Gtk.PackType.END)
         self.split.set_vexpand(True)
         self.split.set_hexpand(True)
-        self.split.props.min_sidebar_width = 360
+        self.split.props.min_sidebar_width = 320
         self.split.props.max_sidebar_width = 360
         self.split.set_sidebar(self._build_details())
         self.split.set_content(self._build_clamped_content())
@@ -460,7 +460,8 @@ class VpnGateWindow(Adw.ApplicationWindow):
 
     def _build_clamped_content(self) -> Gtk.Widget:
         clamp = Adw.Clamp()
-        clamp.props.maximum_size = 1120
+        clamp.props.maximum_size = 780
+        clamp.props.tightening_threshold = 560
         clamp.set_vexpand(True)
         clamp.set_hexpand(True)
         clip_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
@@ -699,7 +700,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
     def _build_details(self) -> Gtk.Widget:
         scroller = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True,
-            width_request=360)
+            width_request=340)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
                       margin_start=14, margin_end=14, margin_top=14,
                       margin_bottom=14)
