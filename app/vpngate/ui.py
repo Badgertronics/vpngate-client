@@ -55,9 +55,44 @@ ICONS_DIR = os.path.join(ROOT_DIR, "icons", "hicolor", "scalable", "apps")
 
 def _make_wrap_box(child_spacing: int = 6, line_spacing: int = 6, **kwargs) -> Gtk.Widget:
     """Create an Adw.WrapBox if Libadwaita >= 1.6, or fallback to Gtk.Box."""
-    if hasattr(Adw, "WrapBox"):
-        return Adw.WrapBox(child_spacing=child_spacing, line_spacing=line_spacing, **kwargs)
+    wrap_cls = getattr(Adw, "WrapBox", None)
+    if wrap_cls is not None:
+        return wrap_cls(child_spacing=child_spacing, line_spacing=line_spacing, **kwargs)
     return Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=child_spacing, **kwargs)
+
+
+class _SheetFallback(Gtk.Box):
+    """Fallback for systems running Libadwaita < 1.6 without Adw.BottomSheet."""
+
+    def __init__(self, content: Gtk.Widget) -> None:
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self._content = content
+        self._content.set_vexpand(True)
+        self._content.set_hexpand(True)
+        self.append(content)
+        self._revealer = Gtk.Revealer(
+            transition_type=Gtk.RevealerTransitionType.SLIDE_UP,
+            reveal_child=False,
+        )
+        self.append(self._revealer)
+
+        class _Props:
+            def __init__(inner):
+                inner.open = False
+                inner.sheet = None
+                inner.content = content
+                inner.full_width = True
+                inner.modal = False
+                inner.show_drag_handle = False
+
+            def __setattr__(inner, name, value):
+                super(_Props, inner).__setattr__(name, value)
+                if name == "open":
+                    self._revealer.set_reveal_child(bool(value))
+                elif name == "sheet" and value is not None:
+                    self._revealer.set_child(value)
+
+        self.props = _Props()
 
 
 # ---------------------------------------------------------------------------
@@ -700,13 +735,17 @@ class VpnGateWindow(Adw.ApplicationWindow):
         return scroller
 
     # -- log bottom sheet --------------------------------------------------------
-    def _build_sheet(self) -> Adw.BottomSheet:
-        sheet = Adw.BottomSheet()
-        sheet.props.full_width = True
-        sheet.props.modal = False
-        sheet.props.open = False
-        sheet.props.show_drag_handle = True
-        sheet.props.content = self.split
+    def _build_sheet(self) -> Gtk.Widget:
+        sheet_cls = getattr(Adw, "BottomSheet", None)
+        if sheet_cls is not None:
+            sheet = sheet_cls()
+            sheet.props.full_width = True
+            sheet.props.modal = False
+            sheet.props.open = False
+            sheet.props.show_drag_handle = True
+            sheet.props.content = self.split
+        else:
+            sheet = _SheetFallback(self.split)
 
         panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
                         margin_top=8, margin_start=14, margin_end=14,
