@@ -16,10 +16,28 @@ from typing import List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 
-def run(cmd: List[str], timeout: int = 30, check: bool = False) -> Tuple[int, str, str]:
+def clean_system_env() -> dict:
+    """Return a clean environment dict without PyInstaller's LD_LIBRARY_PATH.
+
+    When running inside a PyInstaller bundle on Linux, LD_LIBRARY_PATH points to
+    bundled private libraries (like libcrypto.so.3). External system programs
+    (e.g. strongswan/ipsec, xl2tpd, openvpn, curl) must use the OS's native libraries,
+    otherwise symbols like OPENSSL_3.3.0 fail to resolve.
+    """
+    env = dict(os.environ)
+    if "LD_LIBRARY_PATH_ORIG" in env:
+        env["LD_LIBRARY_PATH"] = env["LD_LIBRARY_PATH_ORIG"]
+    else:
+        env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
+def run(cmd: List[str], timeout: int = 30, check: bool = False, env: Optional[dict] = None) -> Tuple[int, str, str]:
     """Run *cmd* and return (returncode, stdout, stderr)."""
+    if env is None and sys.platform != "win32":
+        env = clean_system_env()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         return 124, "", "timeout"
     except FileNotFoundError as exc:

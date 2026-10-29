@@ -217,19 +217,12 @@ def flag_text(code: str) -> str:
 
 
 def flag_widget(code: str, size: int = 20) -> Gtk.Widget:
-    """Return a country flag widget: full SVG image if available, else emoji."""
-    code = (code or "").upper().strip()
-    svg_path = get_flag_svg_path(code)
-    if svg_path:
-        img = Gtk.Image.new_from_file(svg_path)
-        img.set_pixel_size(size)
-        img.props.valign = Gtk.Align.CENTER
-        img.props.halign = Gtk.Align.CENTER
-        return img
-    emoji = flag_emoji(code) or "🌐"
-    return Gtk.Label(label=emoji,
-                     css_classes=["flag"],
-                     valign=Gtk.Align.CENTER)
+    """Return a country flag emoji label widget."""
+    emoji = flag_text(code)
+    lbl = Gtk.Label(label=emoji, css_classes=["flag"], valign=Gtk.Align.CENTER)
+    if size >= 24:
+        lbl.add_css_class("title-2")
+    return lbl
 
 
 def ping_level(ping_ms: int) -> str:

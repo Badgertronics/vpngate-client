@@ -235,6 +235,8 @@ def package_deb(source_dir: Path, output_deb: Path, deb_arch: str) -> None:
         "Priority: optional\n"
         f"Architecture: {deb_arch}\n"
         "Maintainer: Mr. Honey Badger (Badgertronics)\n"
+        "Depends: openvpn, strongswan, xl2tpd, sstp-client\n"
+        "Recommends: softether-vpnclient\n"
         "Description: Graphical VPN Gate client for Linux desktops\n"
         " Connect to the public free VPN servers of VPN Gate.\n"
         " Supports SSL-VPN (SoftEther), L2TP/IPsec, MS-SSTP, and OpenVPN.\n",

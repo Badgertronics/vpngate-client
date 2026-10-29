@@ -204,9 +204,10 @@ class OpenVpnBackend:
         _log_emit(emit, f"Starting OpenVPN ({'UDP' if server.openvpn_udp else 'TCP'} "
                         f"{server.port_for(Protocol.OPENVPN)}) -> {server.ip}")
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+        env = netutil.clean_system_env() if sys.platform != "win32" else None
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True,
-                                bufsize=1, creationflags=creation_flags)
+                                bufsize=1, creationflags=creation_flags, env=env)
         deadline = time.time() + CONNECT_TIMEOUT
         connected = False
         lines: List[str] = []
@@ -831,6 +832,23 @@ def self_cmd() -> str:
     return shutil.which("vpncmd") or "/usr/bin/vpncmd"
 
 
+def _cleanup_windows_ras(vpn_name: str, target_ips: Optional[set] = None) -> None:
+    """Safely terminate stuck rasdial processes and cleanly remove the Windows VPN profile."""
+    if sys.platform != "win32":
+        return
+    subprocess.run(["taskkill", "/F", "/IM", "rasdial.exe"],
+                   capture_output=True, text=True, timeout=5)
+    subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
+                   capture_output=True, text=True, timeout=10)
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                    f"rasphone -h '{vpn_name}' 2>$null; "
+                    f"Get-VpnConnection -Name '{vpn_name}' -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue"],
+                   capture_output=True, text=True, timeout=10)
+    if target_ips:
+        for tip in target_ips:
+            subprocess.run(["route", "delete", tip], capture_output=True, text=True, timeout=5)
+
+
 # ---------------------------------------------------------------------------
 # MS-SSTP
 # ---------------------------------------------------------------------------
@@ -876,12 +894,12 @@ class SstpBackend:
         _log_emit(emit, f"[sstp 1/3] Configuring native Windows MS-SSTP connection to {host} ...")
         started = time.monotonic()
 
-        subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
-                       capture_output=True, text=True, timeout=10)
+        _cleanup_windows_ras(vpn_name)
 
         ps_add = (
             f"Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; "
-            f"Remove-VpnConnection -Name '{vpn_name}' -Force -ErrorAction SilentlyContinue; "
+            f"rasphone -h '{vpn_name}' 2>$null; "
+            f"Get-VpnConnection -Name '{vpn_name}' -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue; "
             f"Add-VpnConnection -Name '{vpn_name}' -ServerAddress '{host}' -TunnelType Sstp "
             f"-EncryptionLevel Optional -AuthenticationMethod Pap,Chap,MSChapv2 "
             f"-SplitTunneling:$false -Force"
@@ -913,24 +931,23 @@ class SstpBackend:
                                capture_output=True, text=True, timeout=10)
 
         _log_emit(emit, f"[sstp 2/3] Dialing {vpn_name} ({host}) via Windows RAS ...")
-        dial_res = subprocess.run(
-            ["rasdial", vpn_name, VPN_USERNAME, VPN_PASSWORD],
-            capture_output=True, text=True, timeout=60
-        )
-        output = (dial_res.stdout or "") + (dial_res.stderr or "")
+        try:
+            dial_res = subprocess.run(
+                ["rasdial", vpn_name, VPN_USERNAME, VPN_PASSWORD],
+                capture_output=True, text=True, timeout=45
+            )
+            output = (dial_res.stdout or "") + (dial_res.stderr or "")
+        except subprocess.TimeoutExpired:
+            _cleanup_windows_ras(vpn_name, target_ips)
+            raise BackendError(f"Windows RAS connection to {host} timed out after 45 seconds.")
+
         for line in output.splitlines():
             line = line.strip()
             if line:
                 _log_emit(emit, f"[rasdial] {line}")
 
         if dial_res.returncode != 0 or "successfully connected" not in output.lower():
-            subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
-                           capture_output=True, text=True, timeout=10)
-            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                            f"Remove-VpnConnection -Name '{vpn_name}' -Force -ErrorAction SilentlyContinue"],
-                           capture_output=True, text=True, timeout=10)
-            for tip in target_ips:
-                subprocess.run(["route", "delete", tip], capture_output=True, text=True, timeout=5)
+            _cleanup_windows_ras(vpn_name, target_ips)
             last_line = output.strip().splitlines()[-1] if output.strip() else "connection failed"
             raise BackendError(f"MS-SSTP connection failed: {last_line}")
 
@@ -1001,8 +1018,9 @@ class SstpBackend:
                         "(HTTPS tunnel, PAP profile vpn/vpn will be used)")
         started = time.monotonic()
         with open(log_path, "w") as logfile:
+            env = netutil.clean_system_env() if sys.platform != "win32" else None
             proc = subprocess.Popen(cmd, stdout=logfile, stderr=logfile,
-                                    stdin=subprocess.DEVNULL)
+                                    stdin=subprocess.DEVNULL, env=env)
 
         deadline = time.time() + CONNECT_TIMEOUT
         iface = ""
@@ -1078,17 +1096,11 @@ class SstpBackend:
     def disconnect(self, info: dict, emit: Emit) -> None:
         if sys.platform == "win32":
             vpn_name = info.get("windows_vpn") or "VPNGate"
-            target_ips = info.get("target_ips") or []
+            target_ips = set(info.get("target_ips") or [])
             if not target_ips and info.get("ip"):
-                target_ips = [info["ip"]]
-            for tip in target_ips:
-                subprocess.run(["route", "delete", tip], capture_output=True, text=True, timeout=10)
+                target_ips = {info["ip"]}
             _log_emit(emit, f"[sstp] Disconnecting Windows RAS connection {vpn_name} ...")
-            subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
-                           capture_output=True, text=True, timeout=15)
-            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                            f"Remove-VpnConnection -Name '{vpn_name}' -Force -ErrorAction SilentlyContinue"],
-                           capture_output=True, text=True, timeout=15)
+            _cleanup_windows_ras(vpn_name, target_ips)
             _log_emit(emit, "Windows MS-SSTP disconnected.")
             return
         started = time.monotonic()
@@ -1146,12 +1158,12 @@ class L2tpBackend:
         _log_emit(emit, f"[l2tp 1/3] Configuring native Windows L2TP/IPsec connection to {host} ...")
         started = time.monotonic()
 
-        subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
-                       capture_output=True, text=True, timeout=10)
+        _cleanup_windows_ras(vpn_name)
 
         ps_add = (
             f"Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; "
-            f"Remove-VpnConnection -Name '{vpn_name}' -Force -ErrorAction SilentlyContinue; "
+            f"rasphone -h '{vpn_name}' 2>$null; "
+            f"Get-VpnConnection -Name '{vpn_name}' -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue; "
             f"Add-VpnConnection -Name '{vpn_name}' -ServerAddress '{host}' -TunnelType L2tp "
             f"-L2tpPsk '{VPN_PSK}' -EncryptionLevel Optional -AuthenticationMethod Pap,Chap,MSChapv2 "
             f"-SplitTunneling:$false -Force"
@@ -1183,24 +1195,23 @@ class L2tpBackend:
                                capture_output=True, text=True, timeout=10)
 
         _log_emit(emit, f"[l2tp 2/3] Dialing {vpn_name} ({host}) via Windows RAS with PSK ...")
-        dial_res = subprocess.run(
-            ["rasdial", vpn_name, VPN_USERNAME, VPN_PASSWORD],
-            capture_output=True, text=True, timeout=60
-        )
-        output = (dial_res.stdout or "") + (dial_res.stderr or "")
+        try:
+            dial_res = subprocess.run(
+                ["rasdial", vpn_name, VPN_USERNAME, VPN_PASSWORD],
+                capture_output=True, text=True, timeout=45
+            )
+            output = (dial_res.stdout or "") + (dial_res.stderr or "")
+        except subprocess.TimeoutExpired:
+            _cleanup_windows_ras(vpn_name, target_ips)
+            raise BackendError(f"Windows RAS connection to {host} timed out after 45 seconds.")
+
         for line in output.splitlines():
             line = line.strip()
             if line:
                 _log_emit(emit, f"[rasdial] {line}")
 
         if dial_res.returncode != 0 or "successfully connected" not in output.lower():
-            subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
-                           capture_output=True, text=True, timeout=10)
-            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                            f"Remove-VpnConnection -Name '{vpn_name}' -Force -ErrorAction SilentlyContinue"],
-                           capture_output=True, text=True, timeout=10)
-            for tip in target_ips:
-                subprocess.run(["route", "delete", tip], capture_output=True, text=True, timeout=5)
+            _cleanup_windows_ras(vpn_name, target_ips)
             last_line = output.strip().splitlines()[-1] if output.strip() else "connection failed"
             raise BackendError(f"L2TP/IPsec connection failed: {last_line}")
 
@@ -1349,10 +1360,11 @@ class L2tpBackend:
         charon = "/usr/lib/ipsec/charon"
         if os.path.exists(charon):
             try:
+                env = netutil.clean_system_env() if sys.platform != "win32" else None
                 self._charon_proc = subprocess.Popen(
                     [charon, "--use-syslog"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL)
+                    stdin=subprocess.DEVNULL, env=env)
             except OSError:
                 pass
             deadline = time.time() + 12
@@ -1482,10 +1494,11 @@ class L2tpBackend:
         log_path = os.path.join(workdir, "xl2tpd.log")
         xl2tpd_bin = netutil.which("xl2tpd") or "/usr/sbin/xl2tpd"
         with open(log_path, "w") as logfile:
+            env = netutil.clean_system_env() if sys.platform != "win32" else None
             proc = subprocess.Popen([xl2tpd_bin, "-D",
                                      "-c", self.XL2TPD_CONF],
                                     stdout=logfile, stderr=logfile,
-                                    stdin=subprocess.DEVNULL)
+                                    stdin=subprocess.DEVNULL, env=env)
         time.sleep(1.5)
         try:
             self._dial()
@@ -1556,17 +1569,11 @@ class L2tpBackend:
     def disconnect(self, info: dict, emit: Emit) -> None:
         if sys.platform == "win32":
             vpn_name = info.get("windows_vpn") or "VPNGate"
-            target_ips = info.get("target_ips") or []
+            target_ips = set(info.get("target_ips") or [])
             if not target_ips and info.get("ip"):
-                target_ips = [info["ip"]]
-            for tip in target_ips:
-                subprocess.run(["route", "delete", tip], capture_output=True, text=True, timeout=10)
+                target_ips = {info["ip"]}
             _log_emit(emit, f"[l2tp] Disconnecting Windows RAS connection {vpn_name} ...")
-            subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
-                           capture_output=True, text=True, timeout=15)
-            subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                            f"Remove-VpnConnection -Name '{vpn_name}' -Force -ErrorAction SilentlyContinue"],
-                           capture_output=True, text=True, timeout=15)
+            _cleanup_windows_ras(vpn_name, target_ips)
             _log_emit(emit, "Windows L2TP/IPsec disconnected.")
             return
         started = time.monotonic()

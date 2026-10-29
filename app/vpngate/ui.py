@@ -15,6 +15,7 @@ from __future__ import annotations
 import faulthandler
 import json
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -336,6 +337,8 @@ class VpnGateApp(Adw.Application):
                     theme.add_search_path(candidate)
                     theme.add_search_path(os.path.dirname(candidate))
         self.win = VpnGateWindow(self)
+        if sys.platform != "win32":
+            self.win.maximize()
         self.win.present()
         if self.settings.get("tray", True):
             self.win.setup_tray()
@@ -384,7 +387,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._search_id: Optional[int] = None
         self.tray: Optional[Tray] = None
 
-        self.set_default_size(1000, 660)
+        self.set_default_size(1060, 720)
         # Floor wide enough for the hero panel in every state (chips, ring,
         # buttons): labels can never be pushed past the window edge.
         self.set_size_request(640, 560)
@@ -501,9 +504,9 @@ class VpnGateWindow(Adw.ApplicationWindow):
                                     label=_("Disconnected"),
                                     ellipsize=Pango.EllipsizeMode.END)
         self.hero_title.props.xalign = 0.0
-        self.hero_sub = Gtk.Label(wrap=True, ellipsize=Pango.EllipsizeMode.END,
+        self.hero_sub = Gtk.Label(wrap=False, lines=1, ellipsize=Pango.EllipsizeMode.END,
                                   css_classes=["hero-sub", "dim-x"])
-        self.hero_sub.props.max_width_chars = 44
+        self.hero_sub.props.max_width_chars = 48
         # WrapBox: if the five tunnel chips exceed the row they fall onto a
         # second line instead of pushing the hero past the window width.
         chips = _make_wrap_box(child_spacing=6, line_spacing=6)
@@ -1545,10 +1548,13 @@ class VpnGateWindow(Adw.ApplicationWindow):
             elif self.state == "connecting":
                 self.hero_ring.set_mode("error")
                 self.hero_title.set_label(_("Connection failed"))
-                self.hero_sub.set_text(message)
+                self.hero_sub.set_text(_("Connection failed. Check log for details."))
                 self.state = "error"
                 self._update_buttons()
-                self.toast(message)
+                toast_msg = message.strip().splitlines()[0] if message else _("Connection failed")
+                if len(toast_msg) > 60:
+                    toast_msg = toast_msg[:57] + "…"
+                self.toast(toast_msg)
         if kind == "bye":
             self._close_everything()
         return False
@@ -1561,7 +1567,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self._hide_chips()
             self.hero_ring.set_mode("connecting")
             self.hero_title.set_label(_("Connecting…"))
-            self.hero_sub.set_text(event.get("message") or _("connecting …"))
+            self.hero_sub.set_text(_("Connecting to relay …"))
             self.state = "connecting"
             self._update_buttons()
         elif state == "connected":
