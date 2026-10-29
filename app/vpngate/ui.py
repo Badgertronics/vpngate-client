@@ -53,6 +53,13 @@ else:
 ICONS_DIR = os.path.join(ROOT_DIR, "icons", "hicolor", "scalable", "apps")
 
 
+def _make_wrap_box(child_spacing: int = 6, line_spacing: int = 6, **kwargs) -> Gtk.Widget:
+    """Create an Adw.WrapBox if Libadwaita >= 1.6, or fallback to Gtk.Box."""
+    if hasattr(Adw, "WrapBox"):
+        return Adw.WrapBox(child_spacing=child_spacing, line_spacing=line_spacing, **kwargs)
+    return Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=child_spacing, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # Settings / crash capture
 # ---------------------------------------------------------------------------
@@ -364,6 +371,8 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self.toolbar = toolbar
         toolbar.add_top_bar(self._build_header())
         self.split = Adw.OverlaySplitView(sidebar_position=Gtk.PackType.END)
+        self.split.props.min_sidebar_width = 360
+        self.split.props.max_sidebar_width = 360
         self.split.set_sidebar(self._build_details())
         self.split.set_content(self._build_clamped_content())
         self.sheet = self._build_sheet()      # assigns content = self.split
@@ -462,7 +471,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self.hero_sub.props.max_width_chars = 44
         # WrapBox: if the five tunnel chips exceed the row they fall onto a
         # second line instead of pushing the hero past the window width.
-        chips = Adw.WrapBox(child_spacing=6, line_spacing=6)
+        chips = _make_wrap_box(child_spacing=6, line_spacing=6)
         self.chip_server = stat_chip("")
         self.chip_tunnel = stat_chip("")
         self.chip_public = stat_chip("")
@@ -538,8 +547,8 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self.quick_strip.append(button)
 
     def _build_filters(self) -> Gtk.Widget:
-        self.filters = Adw.WrapBox(child_spacing=8, line_spacing=8,
-                                   valign=Gtk.Align.CENTER)
+        self.filters = _make_wrap_box(child_spacing=8, line_spacing=8,
+                                      valign=Gtk.Align.CENTER)
         self.search = Gtk.SearchEntry(
             hexpand=True, halign=Gtk.Align.FILL, max_width_chars=40,
             placeholder_text=_("Search country, host or IP … (Ctrl+F)"))
@@ -641,7 +650,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
     def _build_details(self) -> Gtk.Widget:
         scroller = Gtk.ScrolledWindow(
             hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True,
-            width_request=340)
+            width_request=360)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
                       margin_start=14, margin_end=14, margin_top=14,
                       margin_bottom=14)

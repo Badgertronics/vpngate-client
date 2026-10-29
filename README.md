@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="app/icons/hicolor/scalable/apps/VPN%20Gate%20Client%20(Badgertronics).png" alt="VPN Gate Client Logo" width="160" height="160">
+</p>
+
 # 🛡️ VPN Gate Client 🚀
 
 > **A fast, modern, and easy-to-use desktop VPN client for the public [VPN Gate](https://www.vpngate.net) network! 🌍✨**

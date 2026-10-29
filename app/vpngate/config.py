@@ -3,7 +3,7 @@ import sys
 
 APP_NAME = "VPN Gate Client"
 APP_ID = "com.vpngate.client"
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -13,8 +13,67 @@ if getattr(sys, "frozen", False):
 else:
     BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-STATE_DIR = os.path.join(BASE_DIR, "state")
-LOG_DIR = os.path.join(BASE_DIR, "logs")
+
+def _resolve_paths() -> tuple[str, str]:
+    """Return writable (STATE_DIR, LOG_DIR).
+
+    Prefers BASE_DIR/state and BASE_DIR/logs if writable (portable mode).
+    If running as root or if BASE_DIR is read-only (e.g. /usr/lib/vpngate-client
+    or C:\\Program Files), falls back to system runtime or user state directories.
+    """
+    if sys.platform != "win32" and hasattr(os, "geteuid") and os.geteuid() == 0:
+        state_dir = "/run/vpngate-client"
+        logs_dir = "/run/vpngate-client/logs"
+        os.makedirs(state_dir, exist_ok=True)
+        os.makedirs(logs_dir, exist_ok=True)
+        return state_dir, logs_dir
+
+    # Detect whether BASE_DIR is in a standard system installation prefix
+    is_system_path = False
+    if sys.platform != "win32":
+        if BASE_DIR.startswith(("/usr", "/opt", "/var")):
+            is_system_path = True
+    else:
+        norm_base = os.path.normpath(BASE_DIR).lower()
+        for prog in ("c:\\program files", "c:\\program files (x86)"):
+            if norm_base.startswith(prog):
+                is_system_path = True
+                break
+
+    def _is_writable(path: str) -> bool:
+        try:
+            os.makedirs(path, exist_ok=True)
+            test_file = os.path.join(path, ".perm_test")
+            with open(test_file, "w") as f:
+                f.write("ok")
+            os.remove(test_file)
+            return True
+        except (OSError, PermissionError):
+            return False
+
+    candidate_state = os.path.join(BASE_DIR, "state")
+    candidate_logs = os.path.join(BASE_DIR, "logs")
+
+    if not is_system_path and _is_writable(candidate_state) and _is_writable(candidate_logs):
+        return candidate_state, candidate_logs
+
+    if sys.platform == "win32":
+        user_base = os.path.join(
+            os.environ.get("LOCALAPPDATA", os.path.expanduser("~\\AppData\\Local")),
+            "vpngate-client"
+        )
+    else:
+        xdg_state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+        user_base = os.path.join(xdg_state, "vpngate-client")
+
+    state_dir = os.path.join(user_base, "state")
+    logs_dir = os.path.join(user_base, "logs")
+    os.makedirs(state_dir, exist_ok=True)
+    os.makedirs(logs_dir, exist_ok=True)
+    return state_dir, logs_dir
+
+
+STATE_DIR, LOG_DIR = _resolve_paths()
 CONFIG_FILE = os.path.join(STATE_DIR, "settings.json")
 
 # ---------------------------------------------------------------------------

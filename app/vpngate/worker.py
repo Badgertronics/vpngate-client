@@ -17,6 +17,7 @@ from typing import Optional
 
 from . import netutil
 from .backends import BACKENDS, BackendError
+from .config import STATE_DIR
 from .models import Protocol, VpnServer
 
 _emit_lock = threading.Lock()
@@ -33,8 +34,10 @@ class Worker:
         self.connection: Optional[dict] = None
         self.backend = None
         self.protocol: Optional[Protocol] = None
-        self.workdir = os.path.join(os.path.dirname(
-            os.path.dirname(os.path.abspath(__file__))), "state", "run")
+        if sys.platform != "win32" and hasattr(os, "geteuid") and os.geteuid() == 0:
+            self.workdir = "/run/vpngate-client"
+        else:
+            self.workdir = os.path.join(STATE_DIR, "run")
         os.makedirs(self.workdir, exist_ok=True)
         self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._monitor_thread.start()
