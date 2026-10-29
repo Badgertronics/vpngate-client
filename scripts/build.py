@@ -204,8 +204,19 @@ def package_deb(source_dir: Path, output_deb: Path, deb_arch: str) -> None:
     (install_bin / "vpngate-gui").symlink_to(gui_target)
     (install_bin / "vpngate-worker").symlink_to(worker_target)
 
+    # Sudoers rule to allow running worker without password prompt
+    install_sudoers = deb_root / "etc" / "sudoers.d"
+    install_sudoers.mkdir(parents=True, exist_ok=True)
+    sudoers_file = install_sudoers / "vpngate-client"
+    sudoers_file.write_text(
+        "# Allow running the VPN Gate worker without password prompt\n"
+        "ALL ALL=(ALL) NOPASSWD: /usr/lib/vpngate-client/vpngate-worker, /usr/bin/vpngate-gui\n",
+        encoding="utf-8"
+    )
+    sudoers_file.chmod(0o440)
+
     # Copy desktop entry
-    desktop_file = install_apps / "vpngate-gui.desktop"
+    desktop_file = install_apps / "com.vpngate.client.desktop"
     desktop_file.write_text(
         "[Desktop Entry]\n"
         "Type=Application\n"
@@ -216,7 +227,39 @@ def package_deb(source_dir: Path, output_deb: Path, deb_arch: str) -> None:
         "Icon=com.vpngate.client\n"
         "Terminal=false\n"
         "Categories=Network;Security;\n"
-        "StartupNotify=true\n",
+        "Keywords=vpn;vpngate;openvpn;sstp;l2tp;softether;\n"
+        "StartupNotify=true\n"
+        "StartupWMClass=com.vpngate.client\n"
+        "URL=https://github.com/Badgertronics/vpngate-client\n",
+        encoding="utf-8"
+    )
+    legacy_desktop = install_apps / "vpngate-gui.desktop"
+    if legacy_desktop.exists():
+        legacy_desktop.unlink()
+    legacy_desktop.symlink_to(Path("com.vpngate.client.desktop"))
+
+    # AppStream metadata for App Center
+    install_metainfo = deb_root / "usr" / "share" / "metainfo"
+    install_metainfo.mkdir(parents=True, exist_ok=True)
+    metainfo_file = install_metainfo / "com.vpngate.client.metainfo.xml"
+    metainfo_file.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<component type="desktop-application">\n'
+        '  <id>com.vpngate.client</id>\n'
+        '  <metadata_license>CC0-1.0</metadata_license>\n'
+        '  <project_license>GPL-3.0-or-later</project_license>\n'
+        '  <name>VPN Gate Client</name>\n'
+        '  <summary>Graphical VPN Gate client for Linux desktops</summary>\n'
+        '  <description>\n'
+        '    <p>Connect to the public free VPN servers of VPN Gate.</p>\n'
+        '    <p>Supports SSL-VPN (SoftEther), L2TP/IPsec, MS-SSTP, and OpenVPN.</p>\n'
+        '  </description>\n'
+        '  <launchable type="desktop-id">com.vpngate.client.desktop</launchable>\n'
+        '  <url type="homepage">https://github.com/Badgertronics/vpngate-client</url>\n'
+        '  <url type="bugtracker">https://github.com/Badgertronics/vpngate-client/issues</url>\n'
+        '  <url type="vcs-browser">https://github.com/Badgertronics/vpngate-client</url>\n'
+        '  <developer_name>Badgertronics</developer_name>\n'
+        '</component>\n',
         encoding="utf-8"
     )
 
@@ -235,13 +278,27 @@ def package_deb(source_dir: Path, output_deb: Path, deb_arch: str) -> None:
         "Priority: optional\n"
         f"Architecture: {deb_arch}\n"
         "Maintainer: Mr. Honey Badger (Badgertronics)\n"
-        "Depends: openvpn, strongswan, xl2tpd, sstp-client\n"
+        "Homepage: https://github.com/Badgertronics/vpngate-client\n"
+        "Depends: openvpn, strongswan, xl2tpd, sstp-client, python3-netfilterqueue\n"
         "Recommends: softether-vpnclient\n"
         "Description: Graphical VPN Gate client for Linux desktops\n"
         " Connect to the public free VPN servers of VPN Gate.\n"
         " Supports SSL-VPN (SoftEther), L2TP/IPsec, MS-SSTP, and OpenVPN.\n",
         encoding="utf-8"
     )
+
+    # postinst script to ensure proper sudoers file permission
+    postinst_file = debian_dir / "postinst"
+    postinst_file.write_text(
+        "#!/bin/sh\n"
+        "set -e\n"
+        "if [ -f /etc/sudoers.d/vpngate-client ]; then\n"
+        "    chmod 0440 /etc/sudoers.d/vpngate-client\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8"
+    )
+    postinst_file.chmod(0o755)
 
     run([dpkg_deb, "--build", str(deb_root), str(output_deb)])
     shutil.rmtree(deb_root, ignore_errors=True)

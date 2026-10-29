@@ -989,6 +989,8 @@ class SstpBackend:
                 f"user {VPN_USERNAME}\n"
                 f"password {VPN_PASSWORD}\n"
                 "noipdefault\n"
+                "ipcp-accept-local\n"
+                "ipcp-accept-remote\n"
                 "usepeerdns\n"
                 "nodefaultroute\n"
                 "noaccomp\n"
@@ -1248,13 +1250,21 @@ class L2tpBackend:
         netutil.run(cmd, timeout=10)
 
     def _install_fixer(self, emit: Emit) -> None:
-        try:
-            import netfilterqueue           # noqa: F401
-        except ImportError:
+        python3 = shutil.which("python3") or "/usr/bin/python3"
+        code, _, _ = netutil.run([python3, "-c", "import netfilterqueue"])
+        if code != 0:
             _log_emit(emit,
                       "Note: python3-netfilterqueue missing; if the local "
                       "router rewrites ESP-in-UDP checksums the inbound "
                       "side may stay silent.")
+            return
+        csum_candidates = [
+            os.path.join(os.path.dirname(__file__), "csumfix.py"),
+            "/usr/lib/vpngate-client/vpngate/csumfix.py",
+            "/usr/lib/vpngate-client/csumfix.py",
+        ]
+        csumfix = next((p for p in csum_candidates if os.path.exists(p)), None)
+        if not csumfix:
             return
         self._nfqueue_rule("-D")            # clear any stale rule first
         self._nfqueue_rule("-I")
@@ -1262,11 +1272,11 @@ class L2tpBackend:
                 or type(self)._fixer_proc.poll() is not None):
             _log_emit(emit, f"[l2tp] Starting the ESP-in-UDP checksum fixer "
                             f"(NFQUEUE {self.FIX_QUEUE}) ...")
+            env = netutil.clean_system_env()
             type(self)._fixer_proc = subprocess.Popen(
-                [sys.executable, os.path.join(os.path.dirname(__file__),
-                                              "csumfix.py")],
+                [python3, csumfix],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL)
+                stdin=subprocess.DEVNULL, env=env)
 
     @classmethod
     def _remove_fixer(cls) -> None:
@@ -1461,6 +1471,8 @@ class L2tpBackend:
                 f"name {VPN_USERNAME}\n"
                 f"password {VPN_PASSWORD}\n"
                 "noipdefault\n"
+                "ipcp-accept-local\n"
+                "ipcp-accept-remote\n"
                 "usepeerdns\n"
                 "nodefaultroute\n"
                 "novj\n"

@@ -68,6 +68,16 @@ def has_sudo() -> bool:
     return bool(shutil.which("sudo"))
 
 
+def has_passwordless_sudo() -> bool:
+    if not shutil.which("sudo"):
+        return False
+    try:
+        res = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=2)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
 def is_root() -> bool:
     if hasattr(os, "geteuid"):
         return os.geteuid() == 0
@@ -142,7 +152,7 @@ def _via_sudo(env: dict, password: Optional[str]) -> subprocess.Popen:
 def spawn(sudo_password: Optional[str] = None) -> Tuple[subprocess.Popen, str]:
     """Start the worker.  Returns (process, method).
 
-    :raises ``BootstrapError``: when pkexec is unable to run the helper.
+    :raises ``BootstrapError``: when pkexec/sudo is unable to run the helper.
         Callers are expected to ask the user for a sudo password and
         retry with it, which routes directly to the sudo mechanism.
     """
@@ -151,9 +161,13 @@ def spawn(sudo_password: Optional[str] = None) -> Tuple[subprocess.Popen, str]:
         return _spawn(worker_command(), env), "windows"
     if is_root():
         return _spawn(worker_command(), env), "root"
-    if not sudo_password and has_pkexec():
-        proc = _via_pkexec(env)
-        return proc, "pkexec"
+    if sudo_password or has_passwordless_sudo():
+        return _via_sudo(env, sudo_password), "sudo"
+    if has_pkexec():
+        try:
+            return _via_pkexec(env), "pkexec"
+        except BootstrapError:
+            pass
     if not has_sudo():
         raise BootstrapError("neither pkexec nor sudo is available")
-    return _via_sudo(env, sudo_password), "sudo"
+    raise BootstrapError("no polkit agent is available in this session (sudo password required)")

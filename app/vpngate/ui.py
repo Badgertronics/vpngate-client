@@ -337,8 +337,6 @@ class VpnGateApp(Adw.Application):
                     theme.add_search_path(candidate)
                     theme.add_search_path(os.path.dirname(candidate))
         self.win = VpnGateWindow(self)
-        if sys.platform != "win32":
-            self.win.maximize()
         self.win.present()
         if self.settings.get("tray", True):
             self.win.setup_tray()
@@ -387,10 +385,17 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._search_id: Optional[int] = None
         self.tray: Optional[Tray] = None
 
-        self.set_default_size(1060, 720)
-        # Floor wide enough for the hero panel in every state (chips, ring,
-        # buttons): labels can never be pushed past the window edge.
-        self.set_size_request(640, 560)
+        disp = Gdk.Display.get_default()
+        monitors = disp.get_monitors() if disp else None
+        if monitors and monitors.get_n_items() > 0:
+            geom = monitors.get_item(0).get_geometry()
+            target_w = max(680, min(1000, int(geom.width * 0.82)))
+            target_h = max(520, min(700, int(geom.height * 0.82)))
+            self.set_default_size(target_w, target_h)
+        else:
+            self.set_default_size(880, 620)
+        # Floor wide enough for content and hero panel
+        self.set_size_request(600, 480)
         self.set_icon_name(APP_ID)
 
         self._build_ui()
@@ -409,6 +414,8 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self.toolbar = toolbar
         toolbar.add_top_bar(self._build_header())
         self.split = Adw.OverlaySplitView(sidebar_position=Gtk.PackType.END)
+        self.split.set_vexpand(True)
+        self.split.set_hexpand(True)
         self.split.props.min_sidebar_width = 360
         self.split.props.max_sidebar_width = 360
         self.split.set_sidebar(self._build_details())
@@ -454,9 +461,13 @@ class VpnGateWindow(Adw.ApplicationWindow):
     def _build_clamped_content(self) -> Gtk.Widget:
         clamp = Adw.Clamp()
         clamp.props.maximum_size = 1120
+        clamp.set_vexpand(True)
+        clamp.set_hexpand(True)
         clip_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
                            margin_start=12, margin_end=12, margin_top=8,
                            margin_bottom=10, spacing=10)
+        clip_box.set_vexpand(True)
+        clip_box.set_hexpand(True)
         clamp.set_child(clip_box)
         self._fill_content(clip_box)
         return clamp
@@ -739,16 +750,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
 
     # -- log bottom sheet --------------------------------------------------------
     def _build_sheet(self) -> Gtk.Widget:
-        sheet_cls = getattr(Adw, "BottomSheet", None)
-        if sheet_cls is not None:
-            sheet = sheet_cls()
-            sheet.props.full_width = True
-            sheet.props.modal = False
-            sheet.props.open = False
-            sheet.props.show_drag_handle = True
-            sheet.props.content = self.split
-        else:
-            sheet = _SheetFallback(self.split)
+        sheet = _SheetFallback(self.split)
 
         panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
                         margin_top=8, margin_start=14, margin_end=14,
@@ -862,7 +864,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
     def _install_breakpoints(self) -> None:
         breakpoint = Adw.Breakpoint()
         breakpoint.set_condition(
-            Adw.BreakpointCondition.parse("max-width: 640px"))
+            Adw.BreakpointCondition.parse("max-width: 860px"))
         breakpoint.add_setter(self.split, "collapsed", True)
         self.add_breakpoint(breakpoint)
 
@@ -1244,6 +1246,8 @@ class VpnGateWindow(Adw.ApplicationWindow):
 
     def _on_connect_clicked(self, *args) -> None:      # noqa: ANN001
         if self.state in ("connecting", "authorizing"):
+            if self._auth_dialog is not None:
+                return
             self._abort_connect()
             return
         if self.state == "connected":
@@ -1391,6 +1395,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
             body=_("The VPN client needs root privileges to create the "
                    "tunnel. Please enter your password."),
             extra_child=entry)
+        entry.connect("activate", lambda *_: dialog.response("continue"))
         self._auth_dialog = dialog
         dialog.add_response("cancel", _("Cancel"))
         dialog.add_response("continue", _("Continue"))
