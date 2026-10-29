@@ -18,6 +18,7 @@ driven animation honours ``gtk-enable-animations`` so the desktop's
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from typing import List
@@ -183,6 +184,22 @@ def apply_theme_css() -> None:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def get_flag_svg_path(code: str) -> str:
+    code = (code or "").lower().strip()
+    if not code:
+        return ""
+    candidates = [
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "icons", "flags", f"{code}.svg"),
+        os.path.join(os.path.dirname(sys.executable), "icons", "flags", f"{code}.svg"),
+        os.path.join(getattr(sys, "_MEIPASS", ""), "icons", "flags", f"{code}.svg"),
+        os.path.join(os.path.dirname(sys.executable), "_internal", "icons", "flags", f"{code}.svg"),
+    ]
+    for p in candidates:
+        if p and os.path.isfile(p):
+            return p
+    return ""
+
+
 def flag_emoji(code: str) -> str:
     """Turn a two letter country code into its flag emoji."""
     code = (code or "").upper().strip()
@@ -192,22 +209,23 @@ def flag_emoji(code: str) -> str:
 
 
 def flag_text(code: str) -> str:
-    """Country display string: clean code badge on Windows, emoji flag elsewhere."""
+    """Country emoji flag."""
     code = (code or "").upper().strip()
     if not code:
         return "🌐"
-    if sys.platform == "win32":
-        return f"[{code}]"
     return flag_emoji(code) or "🌐"
 
 
-def flag_widget(code: str) -> Gtk.Widget:
-    """Return a country flag widget appropriate for the platform."""
+def flag_widget(code: str, size: int = 20) -> Gtk.Widget:
+    """Return a country flag widget: full SVG image if available, else emoji."""
     code = (code or "").upper().strip()
-    if sys.platform == "win32":
-        return Gtk.Label(label=code or "??",
-                         css_classes=["flag-badge"],
-                         valign=Gtk.Align.CENTER)
+    svg_path = get_flag_svg_path(code)
+    if svg_path:
+        img = Gtk.Image.new_from_file(svg_path)
+        img.set_pixel_size(size)
+        img.props.valign = Gtk.Align.CENTER
+        img.props.halign = Gtk.Align.CENTER
+        return img
     emoji = flag_emoji(code) or "🌐"
     return Gtk.Label(label=emoji,
                      css_classes=["flag"],

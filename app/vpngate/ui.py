@@ -15,6 +15,7 @@ from __future__ import annotations
 import faulthandler
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -30,9 +31,9 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gdk, Gio, Gtk, Pango  # noqa: E402
 
 from . import fetcher, privilege                      # noqa: E402
-from .config import (APP_NAME, DEFAULT_MIRRORS, DEVELOPER_NAME,  # noqa: E402
-                     DONATE_BEP20, DONATE_BITCOIN, DONATE_ETHEREUM,
-                     GITHUB_URL, STATE_DIR, VERSION)
+from .config import (APP_NAME, DEFAULT_CONNECTIVITY_TARGETS, DEFAULT_MIRRORS,  # noqa: E402
+                     DEVELOPER_NAME, DONATE_BEP20, DONATE_BITCOIN,
+                     DONATE_ETHEREUM, GITHUB_URL, STATE_DIR, VERSION)
 from .models import PROTOCOL_ORDER, Protocol, VpnServer  # noqa: E402
 from .tray import Tray                                # noqa: E402
 from .widgets import (SpeedBar, StatusRing, Segmented, apply_theme_css,
@@ -176,6 +177,35 @@ def quick_stack(servers: List[VpnServer], limit: int = 3) -> List[VpnServer]:
     return picks[:limit]
 
 
+def probe_target(target: str, timeout: float = 2.0) -> bool:
+    target = (target or "").strip()
+    if not target:
+        return False
+    try:
+        if ":" in target and not target.startswith("http"):
+            host, port_s = target.split(":", 1)
+            port = int(port_s)
+        elif target.startswith("http://") or target.startswith("https://"):
+            from urllib.parse import urlparse
+            parsed = urlparse(target)
+            host = parsed.hostname or target
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        else:
+            host = target
+            port = 53
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        if not target.startswith("http") and ":" not in target:
+            for p in (80, 443):
+                try:
+                    with socket.create_connection((target, p), timeout=timeout):
+                        return True
+                except Exception:
+                    pass
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
@@ -256,6 +286,13 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self.servers: List[VpnServer] = []
         self.mirrors: List[str] = (self.settings.get("mirrors")
                                    or list(DEFAULT_MIRRORS))
+        self.connectivity_targets: List[str] = (
+            self.settings.get("connectivity_targets")
+            or list(DEFAULT_CONNECTIVITY_TARGETS)
+        )
+        self._watchdog_in_flight = False
+        self._watchdog_last_check = 0.0
+        self._watchdog_failures = 0
         self.state = "idle"          # idle/authorizing/connecting/connected/error
         self.connected_info: Optional[dict] = None
         self.selected: Optional[VpnServer] = None
@@ -583,13 +620,11 @@ class VpnGateWindow(Adw.ApplicationWindow):
         scroller.set_child(box)
 
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        flag_css = ["flag-badge"] if sys.platform == "win32" else ["hero-title"]
-        self.details_flag = Gtk.Label(label="", css_classes=flag_css,
-                                      valign=Gtk.Align.CENTER)
+        self.details_flag_box = Gtk.Box(valign=Gtk.Align.CENTER)
         self.details_country = Gtk.Label(xalign=0, wrap=True,
                                          css_classes=["title-4"],
                                          valign=Gtk.Align.CENTER)
-        header.append(self.details_flag)
+        header.append(self.details_flag_box)
         header.append(self.details_country)
         box.append(header)
 
@@ -1056,7 +1091,9 @@ class VpnGateWindow(Adw.ApplicationWindow):
 
     # -- details ---------------------------------------------------------------
     def _show_details(self, server: VpnServer) -> None:
-        self.details_flag.set_text(flag_text(server.country_code))
+        while child := self.details_flag_box.get_first_child():
+            self.details_flag_box.remove(child)
+        self.details_flag_box.append(flag_widget(server.country_code, size=28))
         self.details_country.set_text(_("{country} relay").format(
             country=server.country or "?"))
         host = server.hostname or server.ip
@@ -1497,7 +1534,6 @@ class VpnGateWindow(Adw.ApplicationWindow):
         for chip, text in texts:
             chip.set_label(text)
             chip.props.tooltip_text = text   # full text survives truncation
-        for chip, _ in texts:
             chip.set_visible(True)
 
     # -- 1 Hz heartbeat ------------------------------------------------------
@@ -1515,7 +1551,45 @@ class VpnGateWindow(Adw.ApplicationWindow):
             minutes, seconds = divmod(rest, 60)
             self.chip_uptime.set_label(_("Up {t}").format(
                 t=f"{hours:02d}:{minutes:02d}:{seconds:02d}"))
+
+            now = time.time()
+            if not self._watchdog_in_flight and (now - self._watchdog_last_check) >= 4.0:
+                self._watchdog_last_check = now
+                self._watchdog_in_flight = True
+                threading.Thread(target=self._run_watchdog_probe, daemon=True).start()
         return True
+
+    def _run_watchdog_probe(self) -> None:
+        targets = list(self.connectivity_targets)
+        success = False
+        for target in targets:
+            if probe_target(target, timeout=2.0):
+                success = True
+                break
+
+        def on_probe_done() -> bool:
+            self._watchdog_in_flight = False
+            if self.state != "connected":
+                self._watchdog_failures = 0
+                return False
+
+            if success:
+                self._watchdog_failures = 0
+            else:
+                self._watchdog_failures += 1
+                if self._watchdog_failures >= 2:
+                    self._watchdog_failures = 0
+                    self._append_log(_("Connection lost: active connectivity check failed (targets unreachable)"))
+                    self.toast(_("Connection lost: Internet or tunnel connection dropped."))
+                    self.hero_ring.set_mode("error")
+                    self.hero_title.set_label(_("Connection lost"))
+                    self.hero_sub.set_text(_("Internet or tunnel connection dropped."))
+                    self.state = "error"
+                    self._update_buttons()
+                    self._send({"cmd": "disconnect"})
+            return False
+
+        GLib.idle_add(on_probe_done)
 
     # -- button state ------------------------------------------------------
     def _set_state(self, state: str, message: Optional[str]) -> None:
@@ -1585,6 +1659,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         dialog = Adw.PreferencesDialog()
         dialog.props.title = _("Settings")
         dialog.add(self._appearance_page())
+        dialog.add(self._connectivity_page(dialog))
         dialog.add(self._mirrors_page(dialog))
         dialog.add(self._support_page(dialog))
         dialog.props.search_enabled = False
@@ -1613,6 +1688,141 @@ class VpnGateWindow(Adw.ApplicationWindow):
         group.add(row)
         page.add(group)
         return page
+
+    def _connectivity_page(self, dialog: Optional[Adw.PreferencesDialog] = None) -> Adw.PreferencesPage:
+        page = Adw.PreferencesPage(title=_("Connectivity"),
+                                   icon_name="network-wireless-symbolic")
+        self._target_group = Adw.PreferencesGroup(
+            title=_("Active connection watchdog endpoints"),
+            description=_("Endpoints (IP addresses or hosts) probed periodically while connected to detect connection loss."))
+        page.add(self._target_group)
+        self._fill_target_rows(dialog)
+
+        add_group = Adw.PreferencesGroup(title=_("Add test endpoint"))
+        entry = Adw.EntryRow(title=_("IP address or host[:port]"), show_apply_button=True)
+        error_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL,
+                            margin_start=12, margin_end=12, margin_top=4)
+        error_label = Gtk.Label(label="", css_classes=["error-hint"],
+                                xalign=0, wrap=True, visible=False)
+        error_box.append(error_label)
+
+        def on_entry_text_changed(row, _param) -> None:
+            if error_label.get_visible():
+                error_label.set_visible(False)
+
+        entry.connect("notify::text", on_entry_text_changed)
+
+        def add_target(_row) -> None:
+            raw = (entry.get_text() or "").strip()
+            if raw and len(raw) >= 3 and " " not in raw:
+                error_label.set_visible(False)
+                if raw not in self.connectivity_targets:
+                    self.connectivity_targets.append(raw)
+                    self._persist_targets()
+                    self._fill_target_rows(dialog)
+                    self._append_log(_("Test target added: {target}").format(target=raw))
+                entry.set_text("")
+                toast = Adw.Toast.new(_("Test endpoint added"))
+                if dialog is not None and hasattr(dialog, "add_toast"):
+                    dialog.add_toast(toast)
+                else:
+                    self.toast(_("Test endpoint added"))
+            else:
+                msg = _("Invalid host/IP. Enter e.g. 1.1.1.1, 8.8.8.8, or cloudflare.com:443")
+                error_label.set_text(msg)
+                error_label.set_visible(True)
+                toast = Adw.Toast.new(msg)
+                toast.props.timeout = 10
+                if dialog is not None and hasattr(dialog, "add_toast"):
+                    dialog.add_toast(toast)
+                else:
+                    self.toast(msg)
+
+        entry.connect("apply", add_target)
+        add_group.add(entry)
+        add_group.add(error_box)
+        page.add(add_group)
+
+        reset_group = Adw.PreferencesGroup()
+        reset_row = Adw.ActionRow(
+            title=_("Test targets list"),
+            subtitle=_("Restore default connectivity test IPs"))
+        reset = Gtk.Button(label=_("Reset"),
+                           css_classes=["flat", "destructive"])
+        reset.connect("clicked", lambda *_: self._reset_targets(dialog))
+        reset_row.add_suffix(reset)
+        reset_group.add(reset_row)
+        page.add(reset_group)
+        return page
+
+    def _persist_targets(self) -> None:
+        self.settings["connectivity_targets"] = list(self.connectivity_targets)
+        save_settings(self.settings)
+
+    def _reset_targets(self, dialog: Optional[Adw.PreferencesDialog] = None) -> None:
+        self.connectivity_targets = list(DEFAULT_CONNECTIVITY_TARGETS)
+        self._persist_targets()
+        self._fill_target_rows(dialog)
+        toast = Adw.Toast.new(_("Default test endpoints restored"))
+        if dialog is not None and hasattr(dialog, "add_toast"):
+            dialog.add_toast(toast)
+        else:
+            self.toast(_("Default test endpoints restored"))
+
+    def _fill_target_rows(self, dialog: Optional[Adw.PreferencesDialog] = None) -> None:
+        group = getattr(self, "_target_group", None)
+        if group is None:
+            return
+        old_rows = getattr(group, "_target_rows", [])
+        for row in list(old_rows):
+            try:
+                if row.get_parent() is not None:
+                    group.remove(row)
+            except Exception:
+                pass
+        group._target_rows = []
+
+        for target in list(self.connectivity_targets):
+            row = Adw.ActionRow(title=target)
+
+            test_btn = Gtk.Button(label=_("Test"),
+                                  css_classes=["flat"],
+                                  valign=Gtk.Align.CENTER)
+            def make_test_handler(t: str):
+                def handler(_btn):
+                    def test_task():
+                        ok = probe_target(t, timeout=3.0)
+                        def deliver():
+                            msg = _("{target} is reachable").format(target=t) if ok else _("{target} is unreachable").format(target=t)
+                            toast = Adw.Toast.new(msg)
+                            if dialog is not None and hasattr(dialog, "add_toast"):
+                                dialog.add_toast(toast)
+                            else:
+                                self.toast(msg)
+                            return False
+                        GLib.idle_add(deliver)
+                    threading.Thread(target=test_task, daemon=True).start()
+                return handler
+            test_btn.connect("clicked", make_test_handler(target))
+            row.add_suffix(test_btn)
+
+            rm_btn = Gtk.Button(icon_name="user-trash-symbolic",
+                                css_classes=["flat", "circular"],
+                                tooltip_text=_("Remove test endpoint"),
+                                valign=Gtk.Align.CENTER)
+            def make_rm_handler(t: str):
+                def handler(_btn):
+                    if t in self.connectivity_targets:
+                        self.connectivity_targets.remove(t)
+                        self._persist_targets()
+                        self._fill_target_rows(dialog)
+                        self._append_log(_("Test target removed: {target}").format(target=t))
+                return handler
+            rm_btn.connect("clicked", make_rm_handler(target))
+            row.add_suffix(rm_btn)
+
+            group.add(row)
+            group._target_rows.append(row)
 
     def _mirrors_page(self, dialog: Optional[Adw.PreferencesDialog] = None) -> Adw.PreferencesPage:
         page = Adw.PreferencesPage(title=_("Mirror sites"),
@@ -1848,12 +2058,16 @@ class VpnGateWindow(Adw.ApplicationWindow):
         if not text:
             return False
         now = time.strftime("%H:%M:%S")
-        self.log_buffer.insert_at_cursor(f"[{now}] {text}\n")
+        end = self.log_buffer.get_end_iter()
+        for line in str(text).splitlines():
+            line = line.strip()
+            if line:
+                self.log_buffer.insert(end, f"[{now}] {line}\n")
         line_count = self.log_buffer.get_line_count()
         if line_count > 1400:
             trim = self.log_buffer.get_iter_at_line(line_count - 1100)
             self.log_buffer.delete(self.log_buffer.get_start_iter(), trim)
-        self.sheet_pill.set_label(str(line_count - 1))
+        self.sheet_pill.set_label(str(max(0, line_count - 1)))
         GLib.idle_add(self._log_follow)
         return False
 

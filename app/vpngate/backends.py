@@ -162,10 +162,12 @@ class OpenVpnBackend:
             text = re.sub(r"^proto\s+udp.*$", "proto tcp", text, flags=re.M)
 
         # Provide the credentials.
-        text = re.sub(r"^#?\s*auth-user-pass\s*$", f"auth-user-pass {auth_path}",
+        auth_conf_path = auth_path.replace("\\", "/")
+        text = re.sub(r"^#?\s*auth-user-pass.*$",
+                      lambda _: f'auth-user-pass "{auth_conf_path}"',
                       text, flags=re.M)
         if "auth-user-pass" not in text:
-            text += f"\nauth-user-pass {auth_path}\n"
+            text += f'\nauth-user-pass "{auth_conf_path}"\n'
 
         # SoftEther's OpenVPN server only speaks very old dialects.
         text += "\npersist-tun\n"
@@ -806,6 +808,28 @@ class SstpBackend:
             return bool(shutil.which("rasdial") or os.path.exists(r"C:\Windows\System32\rasdial.exe"))
         return bool(netutil.which("sstpc")) and bool(netutil.which("pppd"))
 
+    @staticmethod
+    def _configure_windows_vpn_pbk(vpn_name: str) -> None:
+        try:
+            pbk_path = os.path.expandvars(r"%APPDATA%\Microsoft\Network\Connections\Pbk\rasphone.pbk")
+            if not os.path.isfile(pbk_path):
+                return
+            with open(pbk_path, "r", encoding="utf-8", errors="ignore") as handle:
+                content = handle.read()
+            def fix_section(match):
+                block = match.group(0)
+                block = re.sub(r"IpPrioritizeRemote=\d+", "IpPrioritizeRemote=1", block)
+                block = re.sub(r"IpInterfaceMetric=\d+", "IpInterfaceMetric=1", block)
+                block = re.sub(r"Ipv6PrioritizeRemote=\d+", "Ipv6PrioritizeRemote=1", block)
+                block = re.sub(r"Ipv6InterfaceMetric=\d+", "Ipv6InterfaceMetric=1", block)
+                return block
+            pattern = rf"\[{re.escape(vpn_name)}\][\s\S]*?(?=\n\[|\Z)"
+            updated = re.sub(pattern, fix_section, content)
+            with open(pbk_path, "w", encoding="utf-8") as handle:
+                handle.write(updated)
+        except Exception:
+            pass
+
     def _connect_windows(self, server: VpnServer, protocol: Protocol, emit: Emit,
                          workdir: str) -> dict:
         host = server.sstp_host or server.hostname or server.ip
@@ -833,6 +857,7 @@ class SstpBackend:
         if res.returncode != 0:
             err = res.stderr.strip() or res.stdout.strip()
             raise BackendError(f"Failed to create Windows VPN profile for MS-SSTP: {err}")
+        self._configure_windows_vpn_pbk(vpn_name)
 
         _log_emit(emit, f"[sstp 2/3] Dialing {vpn_name} ({host}) via Windows RAS ...")
         dial_res = subprocess.run(
@@ -854,6 +879,11 @@ class SstpBackend:
             last_line = output.strip().splitlines()[-1] if output.strip() else "connection failed"
             raise BackendError(f"MS-SSTP connection failed: {last_line}")
 
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             f"Set-NetIPInterface -InterfaceAlias '{vpn_name}' -InterfaceMetric 1 -ErrorAction SilentlyContinue"],
+            capture_output=True, text=True, timeout=10
+        )
         _log_emit(emit, f"[sstp 3/3] Connected in {_since(started)}: Windows MS-SSTP tunnel is active")
         return {
             "protocol": protocol.value,
@@ -1072,6 +1102,7 @@ class L2tpBackend:
         if res.returncode != 0:
             err = res.stderr.strip() or res.stdout.strip()
             raise BackendError(f"Failed to create Windows VPN profile for L2TP/IPsec: {err}")
+        SstpBackend._configure_windows_vpn_pbk(vpn_name)
 
         _log_emit(emit, f"[l2tp 2/3] Dialing {vpn_name} ({host}) via Windows RAS with PSK ...")
         dial_res = subprocess.run(
@@ -1092,6 +1123,12 @@ class L2tpBackend:
                            capture_output=True, text=True, timeout=10)
             last_line = output.strip().splitlines()[-1] if output.strip() else "connection failed"
             raise BackendError(f"L2TP/IPsec connection failed: {last_line}")
+
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             f"Set-NetIPInterface -InterfaceAlias '{vpn_name}' -InterfaceMetric 1 -ErrorAction SilentlyContinue"],
+            capture_output=True, text=True, timeout=10
+        )
 
         _log_emit(emit, f"[l2tp 3/3] Connected in {_since(started)}: Windows L2TP/IPsec tunnel is active")
         return {

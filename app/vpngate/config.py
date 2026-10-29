@@ -3,7 +3,7 @@ import sys
 
 APP_NAME = "VPN Gate Client"
 APP_ID = "com.vpngate.client"
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -47,6 +47,14 @@ USER_AGENT = (
 CONNECT_TIMEOUT = 45
 # Seconds to wait for a SoftEther session to be established.
 SOFTETHER_TIMEOUT = 60
+
+# Default target endpoints (IPs/hostnames) probed to detect connection loss
+DEFAULT_CONNECTIVITY_TARGETS = [
+    "1.1.1.1",
+    "8.8.8.8",
+    "1.0.0.1",
+    "9.9.9.9",
+]
 
 # ---------------------------------------------------------------------------
 # Online data published by this project's own repository.
