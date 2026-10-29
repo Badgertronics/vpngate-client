@@ -832,6 +832,35 @@ def self_cmd() -> str:
     return shutil.which("vpncmd") or "/usr/bin/vpncmd"
 
 
+def _remove_windows_vpn_pbk_entry(vpn_name: str) -> None:
+    if sys.platform != "win32":
+        return
+    candidates = [
+        os.path.expandvars(r"%APPDATA%\Microsoft\Network\Connections\Pbk\rasphone.pbk"),
+        os.path.expandvars(r"%ALLUSERSPROFILE%\Microsoft\Network\Connections\Pbk\rasphone.pbk"),
+        os.path.expandvars(r"%ProgramData%\Microsoft\Network\Connections\Pbk\rasphone.pbk"),
+        r"C:\ProgramData\Microsoft\Network\Connections\Pbk\rasphone.pbk",
+    ]
+    pattern = re.compile(rf"\[{re.escape(vpn_name)}\][\s\S]*?(?=\n\[|\Z)")
+    seen = set()
+    for path in candidates:
+        norm = os.path.normpath(path).lower()
+        if norm in seen or not os.path.isfile(path):
+            continue
+        seen.add(norm)
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            if f"[{vpn_name}]" in content:
+                new_content = pattern.sub("", content).strip()
+                if new_content:
+                    new_content += "\n"
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(new_content)
+        except Exception:
+            pass
+
+
 def _cleanup_windows_ras(vpn_name: str, target_ips: Optional[set] = None) -> None:
     """Safely terminate stuck rasdial processes and cleanly remove the Windows VPN profile."""
     if sys.platform != "win32":
@@ -842,8 +871,10 @@ def _cleanup_windows_ras(vpn_name: str, target_ips: Optional[set] = None) -> Non
                    capture_output=True, text=True, timeout=10)
     subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
                     f"rasphone -h '{vpn_name}' 2>$null; "
-                    f"Get-VpnConnection -Name '{vpn_name}' -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue"],
+                    f"Get-VpnConnection -Name '{vpn_name}' -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue; "
+                    f"Get-VpnConnection -Name '{vpn_name}' -AllUserConnection -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue"],
                    capture_output=True, text=True, timeout=10)
+    _remove_windows_vpn_pbk_entry(vpn_name)
     if target_ips:
         for tip in target_ips:
             subprocess.run(["route", "delete", tip], capture_output=True, text=True, timeout=5)
@@ -864,25 +895,38 @@ class SstpBackend:
 
     @staticmethod
     def _configure_windows_vpn_pbk(vpn_name: str) -> None:
-        try:
-            pbk_path = os.path.expandvars(r"%APPDATA%\Microsoft\Network\Connections\Pbk\rasphone.pbk")
-            if not os.path.isfile(pbk_path):
-                return
-            with open(pbk_path, "r", encoding="utf-8", errors="ignore") as handle:
-                content = handle.read()
-            def fix_section(match):
-                block = match.group(0)
-                block = re.sub(r"IpPrioritizeRemote=\d+", "IpPrioritizeRemote=1", block)
-                block = re.sub(r"IpInterfaceMetric=\d+", "IpInterfaceMetric=1", block)
-                block = re.sub(r"Ipv6PrioritizeRemote=\d+", "Ipv6PrioritizeRemote=1", block)
-                block = re.sub(r"Ipv6InterfaceMetric=\d+", "Ipv6InterfaceMetric=1", block)
-                return block
-            pattern = rf"\[{re.escape(vpn_name)}\][\s\S]*?(?=\n\[|\Z)"
-            updated = re.sub(pattern, fix_section, content)
-            with open(pbk_path, "w", encoding="utf-8") as handle:
-                handle.write(updated)
-        except Exception:
-            pass
+        if sys.platform != "win32":
+            return
+        candidates = [
+            os.path.expandvars(r"%APPDATA%\Microsoft\Network\Connections\Pbk\rasphone.pbk"),
+            os.path.expandvars(r"%ALLUSERSPROFILE%\Microsoft\Network\Connections\Pbk\rasphone.pbk"),
+            os.path.expandvars(r"%ProgramData%\Microsoft\Network\Connections\Pbk\rasphone.pbk"),
+            r"C:\ProgramData\Microsoft\Network\Connections\Pbk\rasphone.pbk",
+        ]
+        pattern = rf"\[{re.escape(vpn_name)}\][\s\S]*?(?=\n\[|\Z)"
+        def fix_section(match):
+            block = match.group(0)
+            block = re.sub(r"IpPrioritizeRemote=\d+", "IpPrioritizeRemote=1", block)
+            block = re.sub(r"IpInterfaceMetric=\d+", "IpInterfaceMetric=1", block)
+            block = re.sub(r"Ipv6PrioritizeRemote=\d+", "Ipv6PrioritizeRemote=1", block)
+            block = re.sub(r"Ipv6InterfaceMetric=\d+", "Ipv6InterfaceMetric=1", block)
+            return block
+
+        seen = set()
+        for pbk_path in candidates:
+            norm = os.path.normpath(pbk_path).lower()
+            if norm in seen or not os.path.isfile(pbk_path):
+                continue
+            seen.add(norm)
+            try:
+                with open(pbk_path, "r", encoding="utf-8", errors="ignore") as handle:
+                    content = handle.read()
+                if f"[{vpn_name}]" in content:
+                    updated = re.sub(pattern, fix_section, content)
+                    with open(pbk_path, "w", encoding="utf-8") as handle:
+                        handle.write(updated)
+            except Exception:
+                pass
 
     def _connect_windows(self, server: VpnServer, protocol: Protocol, emit: Emit,
                          workdir: str) -> dict:
@@ -900,6 +944,7 @@ class SstpBackend:
             f"Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; "
             f"rasphone -h '{vpn_name}' 2>$null; "
             f"Get-VpnConnection -Name '{vpn_name}' -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue; "
+            f"Get-VpnConnection -Name '{vpn_name}' -AllUserConnection -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue; "
             f"Add-VpnConnection -Name '{vpn_name}' -ServerAddress '{host}' -TunnelType Sstp "
             f"-EncryptionLevel Optional -AuthenticationMethod Pap,Chap,MSChapv2 "
             f"-SplitTunneling:$false -Force"
@@ -1166,6 +1211,7 @@ class L2tpBackend:
             f"Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; "
             f"rasphone -h '{vpn_name}' 2>$null; "
             f"Get-VpnConnection -Name '{vpn_name}' -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue; "
+            f"Get-VpnConnection -Name '{vpn_name}' -AllUserConnection -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue; "
             f"Add-VpnConnection -Name '{vpn_name}' -ServerAddress '{host}' -TunnelType L2tp "
             f"-L2tpPsk '{VPN_PSK}' -EncryptionLevel Optional -AuthenticationMethod Pap,Chap,MSChapv2 "
             f"-SplitTunneling:$false -Force"

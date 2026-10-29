@@ -25,6 +25,11 @@ import traceback
 from gettext import gettext as _
 from typing import Callable, Dict, List, Optional
 
+if sys.platform == "win32":
+    os.environ.setdefault("GSK_RENDERER", "cairo")
+else:
+    os.environ.setdefault("GSK_RENDERER", "gl")
+
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -74,6 +79,7 @@ class _SheetFallback(Gtk.Box):
         self._revealer = Gtk.Revealer(
             transition_type=Gtk.RevealerTransitionType.SLIDE_UP,
             reveal_child=False,
+            visible=False,
         )
         self.append(self._revealer)
 
@@ -89,11 +95,19 @@ class _SheetFallback(Gtk.Box):
             def __setattr__(inner, name, value):
                 super(_Props, inner).__setattr__(name, value)
                 if name == "open":
-                    self._revealer.set_reveal_child(bool(value))
+                    is_open = bool(value)
+                    if is_open:
+                        self._revealer.set_visible(True)
+                    self._revealer.set_reveal_child(is_open)
                 elif name == "sheet" and value is not None:
                     self._revealer.set_child(value)
 
         self.props = _Props()
+        self._revealer.connect("notify::child-revealed", self._on_revealer_transition_done)
+
+    def _on_revealer_transition_done(self, revealer, _param) -> None:
+        if not revealer.get_child_revealed() and not self.props.open:
+            revealer.set_visible(False)
 
 
 # ---------------------------------------------------------------------------
@@ -802,8 +816,9 @@ class VpnGateWindow(Adw.ApplicationWindow):
         panel.append(scroller)
         sheet.props.sheet = panel
 
-        for name, color in (("log-error", "#ff6d6d"), ("log-warn", "#f4b661"),
-                            ("log-ok", "#7fe0a0"), ("log-head", "#8aa0b4")):
+        for name, color in (("log-default", "#f0f3f6"), ("log-error", "#ff6d6d"),
+                            ("log-warn", "#f4b661"), ("log-ok", "#7fe0a0"),
+                            ("log-head", "#8aa0b4")):
             tag = self.log_buffer.create_tag(name)
             tag.props.foreground = color
         return sheet
@@ -1617,10 +1632,16 @@ class VpnGateWindow(Adw.ApplicationWindow):
                 self.hero_sub.set_text(_("Disconnected."))
             self.connected_info = None
             self._session_started = 0.0
+            self._has_logged_first_probe = False
+            self._watchdog_failures = 0
+            self._last_connectivity_log_time = 0.0
             self._hide_chips()
             self._update_buttons()
 
     def _handle_connected(self, info: dict) -> None:
+        self._has_logged_first_probe = False
+        self._watchdog_failures = 0
+        self._last_connectivity_log_time = 0.0
         texts = (
             (self.chip_server, "🔒 " + str(info.get("server") or "-")),
             (self.chip_tunnel, _("Tunnel {ip}").format(ip=info.get("ip")
@@ -1651,22 +1672,6 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self.chip_uptime.set_label(_("Up {t}").format(
                 t=f"{hours:02d}:{minutes:02d}:{seconds:02d}"))
 
-            # Fast check on Windows if native RAS connection dropped
-            win_vpn = self.connected_info.get("windows_vpn")
-            if win_vpn and sys.platform == "win32":
-                try:
-                    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                    proc_check = subprocess.run(["rasdial"], capture_output=True, text=True,
-                                                timeout=2, creationflags=creation_flags)
-                    if win_vpn.lower() not in proc_check.stdout.lower():
-                        self._append_log(_("Windows connection {vpn} dropped.").format(vpn=win_vpn))
-                        self.toast(_("Windows connection {vpn} dropped.").format(vpn=win_vpn))
-                        self._handle_state({"state": "disconnected"})
-                        self._send({"cmd": "disconnect"})
-                        return True
-                except Exception:
-                    pass
-
             now = time.time()
             if not self._watchdog_in_flight and (now - self._watchdog_last_check) >= 4.0:
                 self._watchdog_last_check = now
@@ -1677,9 +1682,14 @@ class VpnGateWindow(Adw.ApplicationWindow):
     def _run_watchdog_probe(self) -> None:
         targets = list(self.connectivity_targets)
         success = False
+        reached_target = None
+        rtt_ms = 0
         for target in targets:
-            if probe_target(target, timeout=2.0):
+            t0 = time.time()
+            if probe_target(target, timeout=2.5):
                 success = True
+                reached_target = target
+                rtt_ms = max(1, int((time.time() - t0) * 1000))
                 break
 
         def on_probe_done() -> bool:
@@ -1688,13 +1698,32 @@ class VpnGateWindow(Adw.ApplicationWindow):
                 self._watchdog_failures = 0
                 return False
 
+            now = time.time()
+            has_logged = getattr(self, "_has_logged_first_probe", False)
+            last_log = getattr(self, "_last_connectivity_log_time", 0.0)
+
             if success:
                 self._watchdog_failures = 0
+                if not has_logged:
+                    self._has_logged_first_probe = True
+                    self._last_connectivity_log_time = now
+                    self._append_log(_("[connectivity] Internet verified: {target} reached in {ms} ms (tunnel carrying traffic)").format(target=reached_target, ms=rtt_ms))
+                elif (now - last_log) >= 25.0:
+                    self._last_connectivity_log_time = now
+                    self._append_log(_("[connectivity] Probe OK: {target} responded in {ms} ms").format(target=reached_target, ms=rtt_ms))
             else:
                 self._watchdog_failures += 1
+                targets_str = ", ".join(targets)
+                if not has_logged:
+                    self._has_logged_first_probe = True
+                    self._last_connectivity_log_time = now
+                    self._append_log(_("[connectivity] Initial check warning: {targets} did not respond").format(targets=targets_str))
+                else:
+                    self._append_log(_("[connectivity] Check warning: {targets} unreachable (attempt {attempt}/2)").format(targets=targets_str, attempt=self._watchdog_failures))
+
                 if self._watchdog_failures >= 2:
                     self._watchdog_failures = 0
-                    self._append_log(_("Connection lost: active connectivity check failed (targets unreachable)"))
+                    self._append_log(_("[connectivity] ERROR: Connection lost — active connectivity check failed (targets unreachable)"))
                     self.toast(_("Connection lost: Internet or tunnel connection dropped."))
                     self.hero_ring.set_mode("error")
                     self.hero_title.set_label(_("Connection lost"))
@@ -1906,9 +1935,16 @@ class VpnGateWindow(Adw.ApplicationWindow):
             def make_test_handler(t: str):
                 def handler(_btn):
                     def test_task():
+                        t0 = time.time()
                         ok = probe_target(t, timeout=3.0)
+                        ms = max(1, int((time.time() - t0) * 1000))
                         def deliver():
-                            msg = _("{target} is reachable").format(target=t) if ok else _("{target} is unreachable").format(target=t)
+                            if ok:
+                                msg = _("{target} is reachable ({ms} ms)").format(target=t, ms=ms)
+                                self._append_log(_("[connectivity] Manual test: {target} is reachable ({ms} ms)").format(target=t, ms=ms))
+                            else:
+                                msg = _("{target} is unreachable").format(target=t)
+                                self._append_log(_("[connectivity] Manual test: {target} is unreachable").format(target=t))
                             toast = Adw.Toast.new(msg)
                             if dialog is not None and hasattr(dialog, "add_toast"):
                                 dialog.add_toast(toast)
@@ -2173,11 +2209,23 @@ class VpnGateWindow(Adw.ApplicationWindow):
         if not text:
             return False
         now = time.strftime("%H:%M:%S")
-        end = self.log_buffer.get_end_iter()
         for line in str(text).splitlines():
             line = line.strip()
-            if line:
-                self.log_buffer.insert(end, f"[{now}] {line}\n")
+            if not line:
+                continue
+            lower = line.lower()
+            if "error" in lower or "failed" in lower or "cannot create" in lower:
+                tag_name = "log-error"
+            elif "warning" in lower or "timed out" in lower or "dropping" in lower or "unreachable" in lower:
+                tag_name = "log-warn"
+            elif "successfully" in lower or "connected in" in lower or "is active" in lower or "verified:" in lower or "ok:" in lower or "reachable" in lower:
+                tag_name = "log-ok"
+            elif line.startswith("[") and ("1/3" in line or "2/3" in line or "3/3" in line or "1/5" in line or "connectivity" in lower):
+                tag_name = "log-head"
+            else:
+                tag_name = "log-default"
+            end = self.log_buffer.get_end_iter()
+            self.log_buffer.insert_with_tags_by_name(end, f"[{now}] {line}\n", tag_name)
         line_count = self.log_buffer.get_line_count()
         if line_count > 1400:
             trim = self.log_buffer.get_iter_at_line(line_count - 1100)

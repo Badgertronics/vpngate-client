@@ -39,6 +39,7 @@ class Worker:
         else:
             self.workdir = os.path.join(STATE_DIR, "run")
         os.makedirs(self.workdir, exist_ok=True)
+        self._win_vpn_missed = 0
         self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._monitor_thread.start()
 
@@ -47,6 +48,7 @@ class Worker:
             time.sleep(1.5)
             conn = self.connection
             if conn is None:
+                self._win_vpn_missed = 0
                 continue
 
             # 1. Process-based VPN check (OpenVPN / sstpc / xl2tpd)
@@ -66,9 +68,14 @@ class Worker:
                     res = subprocess.run(["rasdial"], capture_output=True, text=True,
                                          timeout=5, creationflags=creation_flags)
                     if win_vpn.lower() not in res.stdout.lower():
-                        self._log(f"Windows VPN '{win_vpn}' connection dropped.")
-                        _emit({"event": "error", "message": f"Windows VPN '{win_vpn}' connection dropped."})
-                        self.do_disconnect()
+                        self._win_vpn_missed += 1
+                        if self._win_vpn_missed >= 2:
+                            self._win_vpn_missed = 0
+                            self._log(f"Windows VPN '{win_vpn}' connection dropped.")
+                            _emit({"event": "error", "message": f"Windows VPN '{win_vpn}' connection dropped."})
+                            self.do_disconnect()
+                    else:
+                        self._win_vpn_missed = 0
                 except Exception:
                     pass
 
@@ -162,6 +169,7 @@ class Worker:
                "message": f"Connected to {server.hostname} via {backend.name}"})
 
     def do_disconnect(self) -> None:
+        self._win_vpn_missed = 0
         if self.connection is None or self.backend is None:
             _emit({"event": "state", "state": "disconnected"})
             return

@@ -120,12 +120,16 @@ CSS_BASE = """
     font-size: 90%;
 }
 
-/* ---- the terminal log -------------------------------------------------------- */
-textview.vpn-log text {
+/* ---- the terminal log (always dark terminal with white text) -------------- */
+textview.vpn-log,
+textview.vpn-log > text,
+textview.vpn-log text,
+textview.vpn-log:not(:disabled),
+textview.vpn-log:not(:disabled) text {
     font-family: "DejaVu Sans Mono", "Ubuntu Mono", monospace;
     font-size: 88%;
-    background-color: rgba(15,16,20,0.93);
-    color: rgb(214,219,226);
+    background-color: #0f1014;
+    color: #f0f3f6;
 }
 .log-note {
     background-color: rgba(250,179,52,0.14);
