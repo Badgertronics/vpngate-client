@@ -68,9 +68,9 @@ def _make_wrap_box(child_spacing: int = 6, line_spacing: int = 6, **kwargs) -> G
 
 
 class _SheetFallback(Gtk.Box):
-    """Fallback for systems running Libadwaita < 1.6 without Adw.BottomSheet."""
+    """Container with a stretchable bottom log drawer."""
 
-    def __init__(self, content: Gtk.Widget) -> None:
+    def __init__(self, content: Gtk.Widget, initial_height: int = 240) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self._content = content
         self._content.set_vexpand(True)
@@ -82,6 +82,9 @@ class _SheetFallback(Gtk.Box):
             visible=False,
         )
         self.append(self._revealer)
+        self._log_height = max(80, int(initial_height))
+        self._panel: Optional[Gtk.Widget] = None
+        self._handle: Optional[Gtk.Widget] = None
 
         class _Props:
             def __init__(inner):
@@ -98,12 +101,67 @@ class _SheetFallback(Gtk.Box):
                     is_open = bool(value)
                     if is_open:
                         self._revealer.set_visible(True)
+                        if self._panel is not None:
+                            self._panel.props.height_request = self._log_height
                     self._revealer.set_reveal_child(is_open)
                 elif name == "sheet" and value is not None:
-                    self._revealer.set_child(value)
+                    self._attach_sheet(value)
 
         self.props = _Props()
         self._revealer.connect("notify::child-revealed", self._on_revealer_transition_done)
+
+    def _attach_sheet(self, panel: Gtk.Widget) -> None:
+        self._panel = panel
+        panel.props.height_request = self._log_height
+
+        # Drag handle at the top of the log panel
+        handle = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        handle.add_css_class("log-drag-handle")
+        handle.props.height_request = 10
+        try:
+            handle.set_cursor_from_name("row-resize")
+        except Exception:
+            pass
+
+        grip = Gtk.Box()
+        grip.props.width_request = 38
+        grip.props.height_request = 3
+        grip.props.halign = Gtk.Align.CENTER
+        grip.props.valign = Gtk.Align.CENTER
+        grip.add_css_class("log-drag-grip")
+        handle.append(grip)
+
+        drag = Gtk.GestureDrag()
+        initial_h = [self._log_height]
+
+        def on_drag_begin(_g, _x, _y):
+            curr = panel.get_height()
+            initial_h[0] = curr if curr > 0 else self._log_height
+
+        def on_drag_update(_g, _ox, oy):
+            # Dragging upwards (negative oy) increases panel height
+            max_h = 700
+            root = self.get_root()
+            if root is not None and hasattr(root, "get_height"):
+                max_h = max(180, root.get_height() - 100)
+            new_h = int(max(80, min(max_h, initial_h[0] - oy)))
+            self._log_height = new_h
+            panel.set_size_request(-1, new_h)
+
+        def on_drag_end(_g, _ox, _oy):
+            root = self.get_root()
+            if root is not None and hasattr(root, "settings"):
+                root.settings["log_height"] = self._log_height
+                save_settings(root.settings)
+
+        drag.connect("drag-begin", on_drag_begin)
+        drag.connect("drag-update", on_drag_update)
+        drag.connect("drag-end", on_drag_end)
+        handle.add_controller(drag)
+        self._handle = handle
+
+        panel.prepend(handle)
+        self._revealer.set_child(panel)
 
     def _on_revealer_transition_done(self, revealer, _param) -> None:
         if not revealer.get_child_revealed() and not self.props.open:
@@ -234,61 +292,99 @@ def quick_stack(servers: List[VpnServer], limit: int = 3) -> List[VpnServer]:
     return picks[:limit]
 
 
-def probe_target(target: str, timeout: float = 3.0) -> bool:
+def probe_target_detailed(target: str, timeout: float = 3.5) -> tuple[bool, int, str]:
+    """Probe a connectivity target and return (is_reachable, rtt_ms, detail_str)."""
     target = (target or "").strip()
     if not target:
-        return False
+        return False, 0, "Address is empty"
     import ssl
+    import urllib.error
     import urllib.request
+
+    t0 = time.time()
 
     # 1. Explicit HTTP / HTTPS URL
     if target.startswith("http://") or target.startswith("https://"):
         try:
-            req = urllib.request.Request(target, headers={"User-Agent": "Mozilla/5.0"})
+            req = urllib.request.Request(target, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VPN-Gate-Tester/1.0"})
             ctx = ssl.create_default_context()
             with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-                return resp.status < 500
-        except Exception:
-            return False
+                ms = max(1, int((time.time() - t0) * 1000))
+                status = resp.status
+                reason = getattr(resp, "reason", "OK")
+                return status < 500, ms, f"HTTP {status} {reason}"
+        except urllib.error.HTTPError as ex:
+            ms = max(1, int((time.time() - t0) * 1000))
+            return ex.code < 500, ms, f"HTTP {ex.code} {ex.reason}"
+        except urllib.error.URLError as ex:
+            ms = max(1, int((time.time() - t0) * 1000))
+            return False, ms, str(ex.reason)
+        except Exception as ex:
+            ms = max(1, int((time.time() - t0) * 1000))
+            return False, ms, str(ex)
 
     # 2. host:port specified
-    if ":" in target:
+    if ":" in target and not target.startswith("["):
         try:
-            host, port_s = target.split(":", 1)
+            host, port_s = target.rsplit(":", 1)
             port = int(port_s)
             with socket.create_connection((host, port), timeout=timeout):
-                return True
-        except Exception:
-            return False
+                ms = max(1, int((time.time() - t0) * 1000))
+                return True, ms, f"TCP port {port} open"
+        except socket.timeout:
+            ms = max(1, int((time.time() - t0) * 1000))
+            return False, ms, f"TCP connection to port {port} timed out"
+        except Exception as ex:
+            ms = max(1, int((time.time() - t0) * 1000))
+            return False, ms, str(ex)
 
     # 3. Numeric IPv4 address (e.g. 1.1.1.1, 8.8.8.8)
     if re.match(r"^\d+\.\d+\.\d+\.\d+$", target):
-        try:
-            with socket.create_connection((target, 53), timeout=timeout):
-                return True
-        except Exception:
+        for test_port in (53, 443, 80):
             try:
-                with socket.create_connection((target, 443), timeout=timeout):
-                    return True
+                with socket.create_connection((target, test_port), timeout=timeout):
+                    ms = max(1, int((time.time() - t0) * 1000))
+                    return True, ms, f"TCP port {test_port} connected"
             except Exception:
-                return False
+                pass
+        ms = max(1, int((time.time() - t0) * 1000))
+        return False, ms, "Ports 53/443/80 unreachable"
 
     # 4. Hostname (e.g. youtube.com, google.com, cloudflare.com)
     # Perform strict HTTPS probe with SSL verification so DPI/censorship proxies cannot fake it
     try:
         url = f"https://{target}"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VPN-Gate-Tester/1.0"})
         ctx = ssl.create_default_context()
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-            return resp.status < 500
-    except Exception:
+            ms = max(1, int((time.time() - t0) * 1000))
+            status = resp.status
+            reason = getattr(resp, "reason", "OK")
+            return status < 500, ms, f"HTTPS {status} {reason} (TLS verified)"
+    except urllib.error.HTTPError as ex:
+        ms = max(1, int((time.time() - t0) * 1000))
+        return ex.code < 500, ms, f"HTTPS {ex.code} {ex.reason}"
+    except Exception as ex_https:
+        err_msg = str(ex_https)
         try:
             url = f"http://{target}"
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VPN-Gate-Tester/1.0"})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.status < 500
+                ms = max(1, int((time.time() - t0) * 1000))
+                status = resp.status
+                reason = getattr(resp, "reason", "OK")
+                return status < 500, ms, f"HTTP {status} {reason}"
+        except urllib.error.HTTPError as ex:
+            ms = max(1, int((time.time() - t0) * 1000))
+            return ex.code < 500, ms, f"HTTP {ex.code} {ex.reason}"
         except Exception:
-            return False
+            ms = max(1, int((time.time() - t0) * 1000))
+            return False, ms, err_msg
+
+
+def probe_target(target: str, timeout: float = 3.0) -> bool:
+    ok, _ms, _details = probe_target_detailed(target, timeout=timeout)
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -776,12 +872,12 @@ class VpnGateWindow(Adw.ApplicationWindow):
 
     # -- log bottom sheet --------------------------------------------------------
     def _build_sheet(self) -> Gtk.Widget:
-        sheet = _SheetFallback(self.split)
+        initial_h = self.settings.get("log_height", 240)
+        sheet = _SheetFallback(self.split, initial_height=initial_h)
 
         panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
-                        margin_top=8, margin_start=14, margin_end=14,
+                        margin_top=4, margin_start=14, margin_end=14,
                         margin_bottom=10)
-        panel.props.height_request = 260
         head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         head.append(Gtk.Label(label=_("Connection log"), xalign=0,
                               css_classes=["title-4"]))
@@ -1932,19 +2028,36 @@ class VpnGateWindow(Adw.ApplicationWindow):
             test_btn = Gtk.Button(label=_("Test"),
                                   css_classes=["flat"],
                                   valign=Gtk.Align.CENTER)
-            def make_test_handler(t: str):
+            spinner = Gtk.Spinner(spinning=False,
+                                  visible=False,
+                                  valign=Gtk.Align.CENTER)
+            test_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
+                               spacing=6,
+                               valign=Gtk.Align.CENTER)
+            test_box.append(spinner)
+            test_box.append(test_btn)
+
+            def make_test_handler(t: str, btn: Gtk.Button, sp: Gtk.Spinner):
                 def handler(_btn):
+                    btn.set_sensitive(False)
+                    sp.set_visible(True)
+                    sp.start()
+                    self._append_log(_("[connectivity] Testing endpoint '{target}' ...").format(target=t))
+
                     def test_task():
-                        t0 = time.time()
-                        ok = probe_target(t, timeout=3.0)
-                        ms = max(1, int((time.time() - t0) * 1000))
+                        ok, ms, details = probe_target_detailed(t, timeout=3.5)
                         def deliver():
+                            sp.stop()
+                            sp.set_visible(False)
+                            btn.set_sensitive(True)
                             if ok:
                                 msg = _("{target} is reachable ({ms} ms)").format(target=t, ms=ms)
-                                self._append_log(_("[connectivity] Manual test: {target} is reachable ({ms} ms)").format(target=t, ms=ms))
+                                self._append_log(_("[connectivity] ✓ Endpoint '{target}' is reachable in {ms} ms ({details})").format(
+                                    target=t, ms=ms, details=details))
                             else:
-                                msg = _("{target} is unreachable").format(target=t)
-                                self._append_log(_("[connectivity] Manual test: {target} is unreachable").format(target=t))
+                                msg = _("{target} is unreachable ({details})").format(target=t, details=details)
+                                self._append_log(_("[connectivity] ✗ Endpoint '{target}' is unreachable ({details})").format(
+                                    target=t, details=details))
                             toast = Adw.Toast.new(msg)
                             if dialog is not None and hasattr(dialog, "add_toast"):
                                 dialog.add_toast(toast)
@@ -1954,8 +2067,8 @@ class VpnGateWindow(Adw.ApplicationWindow):
                         GLib.idle_add(deliver)
                     threading.Thread(target=test_task, daemon=True).start()
                 return handler
-            test_btn.connect("clicked", make_test_handler(target))
-            row.add_suffix(test_btn)
+            test_btn.connect("clicked", make_test_handler(target, test_btn, spinner))
+            row.add_suffix(test_box)
 
             rm_btn = Gtk.Button(icon_name="user-trash-symbolic",
                                 css_classes=["flat", "circular"],

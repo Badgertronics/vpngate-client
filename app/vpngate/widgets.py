@@ -139,6 +139,27 @@ textview.vpn-log:not(:disabled) text {
     font-size: 88%;
 }
 
+/* ---- stretchable log drawer drag handle ---------------------------------- */
+paned.log-paned > separator,
+.log-drag-handle {
+    min-height: 10px;
+    background-color: alpha(@window_fg_color, 0.06);
+    border-top: 1px solid alpha(@window_fg_color, 0.12);
+    margin-bottom: 2px;
+    transition: background-color 150ms ease-in-out;
+}
+paned.log-paned > separator:hover,
+.log-drag-handle:hover {
+    background-color: alpha(@accent_color, 0.35);
+}
+.log-drag-grip {
+    background-color: alpha(@window_fg_color, 0.28);
+    border-radius: 9999px;
+}
+.log-drag-handle:hover .log-drag-grip {
+    background-color: alpha(@accent_fg_color, 0.90);
+}
+
 /* ---- skeleton shimmer ---------------------------------------------------------- */
 @keyframes skel-pulse {
     from { opacity: 0.55; }
@@ -200,6 +221,25 @@ def get_flag_svg_path(code: str) -> str:
     ]
     for p in candidates:
         if p and os.path.isfile(p):
+            return p
+    return ""
+
+
+def get_icon_path(name: str) -> str:
+    """Resolve an icon file or directory across dev, portable, and system install paths."""
+    name = (name or "").strip()
+    if not name:
+        return ""
+    candidates = [
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "icons", name),
+        os.path.join(os.path.dirname(sys.executable), "icons", name),
+        os.path.join(getattr(sys, "_MEIPASS", ""), "icons", name),
+        os.path.join(os.path.dirname(sys.executable), "_internal", "icons", name),
+        os.path.join("/usr/lib/vpngate-client", "icons", name),
+        os.path.join("/usr/share/vpngate-client", "icons", name),
+    ]
+    for p in candidates:
+        if p and (os.path.isfile(p) or os.path.isdir(p)):
             return p
     return ""
 
@@ -330,7 +370,12 @@ def animations_enabled() -> bool:
 def round_rect(cr: cairo.Context, x: float, y: float, w: float, h: float,
                r: float) -> None:
     """Trace a rounded rectangle path on *cr*."""
-    r = min(r, w / 2, h / 2)
+    if w <= 0.001 or h <= 0.001:
+        return
+    r = max(0.0, min(float(r), float(w) / 2.0, float(h) / 2.0))
+    if r <= 0.001:
+        cr.rectangle(x, y, w, h)
+        return
     pi = 3.14159265358979
     cr.new_sub_path()
     cr.arc(x + w - r, y + r, r, -0.5 * pi, 0)
@@ -357,9 +402,9 @@ def _hex(hexstr: str, alpha: float = 1.0) -> tuple:
 class StatusRing(Gtk.DrawingArea):
     """The animated connection emblem at the heart of the hero panel.
 
-    Modes: ``idle`` (dim padlock), ``authorizing`` (breathing ring),
-    ``connecting`` (rotating sweep), ``connected`` (solid green ring, check
-    mark, one rewarding pulse), ``error`` (red ring with dot).
+    Modes: ``idle`` (dim padlock), ``authorizing`` / ``connecting`` (circular
+    loading GIF animation + rotating sweep ring), ``connected`` (solid green ring,
+    rewarding pulse, success mascot), ``error`` (red ring with failure mascot).
     """
 
     MODE_COLOR = {
@@ -380,7 +425,43 @@ class StatusRing(Gtk.DrawingArea):
         self._t0 = time.monotonic()
         self._breathe_until = 0.0
         self._tick = None
+        self._assets_loaded = False
+        self._loading_frames: List[cairo.ImageSurface] = []
+        self._success_surf: Optional[cairo.ImageSurface] = None
+        self._failure_surf: Optional[cairo.ImageSurface] = None
         self.set_draw_func(self._draw, None)
+
+    def _ensure_assets(self) -> None:
+        if self._assets_loaded:
+            return
+        self._assets_loaded = True
+
+        # 1. Animated loading frames
+        frames_dir = get_icon_path("loading_frames")
+        if frames_dir and os.path.isdir(frames_dir):
+            for i in range(51):
+                p = os.path.join(frames_dir, f"frame_{i:02d}.png")
+                if os.path.isfile(p):
+                    try:
+                        self._loading_frames.append(cairo.ImageSurface.create_from_png(p))
+                    except Exception:
+                        pass
+
+        # 2. Success mascot
+        s_path = get_icon_path("success_112.png") or get_icon_path("success.png")
+        if s_path and os.path.isfile(s_path):
+            try:
+                self._success_surf = cairo.ImageSurface.create_from_png(s_path)
+            except Exception:
+                pass
+
+        # 3. Failure mascot
+        f_path = get_icon_path("failure_112.png") or get_icon_path("failure.png")
+        if f_path and os.path.isfile(f_path):
+            try:
+                self._failure_surf = cairo.ImageSurface.create_from_png(f_path)
+            except Exception:
+                pass
 
     # -- lifecycle ----------------------------------------------------------
     def set_mode(self, mode: str) -> None:
@@ -422,14 +503,56 @@ class StatusRing(Gtk.DrawingArea):
         if w <= 0 or h <= 0:
             return False
         s = min(w, h)
+        if s < 10:
+            return False
         cx, cy = w / 2, h / 2
-        r = s / 2 - 13
-        if r < 20:
-            r = max(18, s / 2 - 8)
+        r = max(10.0, s / 2 - 13)
         color = self.MODE_COLOR.get(self.mode, self.MODE_COLOR["idle"])
         age = time.monotonic() - self._t0
 
-        # background ring track
+        self._ensure_assets()
+        target_size = min(int(r * 1.82), int(s - 26))
+
+        # Render center emblem image based on mode
+        if self.mode in ("connecting", "authorizing") and self._loading_frames:
+            frame_idx = int((age * 20) % len(self._loading_frames))
+            surf = self._loading_frames[frame_idx]
+            sw, sh = surf.get_width(), surf.get_height()
+            cr.save()
+            if sw != target_size and sw > 0:
+                scale = target_size / sw
+                cr.scale(scale, scale)
+                cr.set_source_surface(surf, (cx - target_size / 2) / scale, (cy - target_size / 2) / scale)
+            else:
+                cr.set_source_surface(surf, cx - sw / 2, cy - sh / 2)
+            cr.paint()
+            cr.restore()
+        elif self.mode == "connected" and self._success_surf:
+            surf = self._success_surf
+            sw, sh = surf.get_width(), surf.get_height()
+            cr.save()
+            if sw != target_size and sw > 0:
+                scale = target_size / sw
+                cr.scale(scale, scale)
+                cr.set_source_surface(surf, (cx - target_size / 2) / scale, (cy - target_size / 2) / scale)
+            else:
+                cr.set_source_surface(surf, cx - sw / 2, cy - sh / 2)
+            cr.paint()
+            cr.restore()
+        elif self.mode == "error" and self._failure_surf:
+            surf = self._failure_surf
+            sw, sh = surf.get_width(), surf.get_height()
+            cr.save()
+            if sw != target_size and sw > 0:
+                scale = target_size / sw
+                cr.scale(scale, scale)
+                cr.set_source_surface(surf, (cx - target_size / 2) / scale, (cy - target_size / 2) / scale)
+            else:
+                cr.set_source_surface(surf, cx - sw / 2, cy - sh / 2)
+            cr.paint()
+            cr.restore()
+
+        # Background ring track
         cr.set_source_rgba(*_hex(color, 0.13))
         cr.set_line_width(7)
         cr.arc(cx, cy, r, 0, 2 * 3.14159265358979)
@@ -451,7 +574,7 @@ class StatusRing(Gtk.DrawingArea):
         # a calm padlock silhouette inside the ring
         cr.set_source_rgba(*_hex("#8a97ac", 0.45))
         cr.set_line_width(2.6)
-        sh = r * 0.42
+        sh = max(1.0, r * 0.42)
         cr.arc(cx, cy + r * 0.06, sh, 3.14159265358979, 2 * 3.14159265358979)
         cr.stroke()
         bw = sh * 2.0
@@ -460,7 +583,7 @@ class StatusRing(Gtk.DrawingArea):
         round_rect(cr, cx - bw / 2, by, bw, bh, 5)
         cr.stroke()
         cr.set_source_rgba(*_hex("#8a97ac", 0.62))
-        cr.arc(cx, by + bh * 0.16 + bh * 0.36, sh * 0.16, 0,
+        cr.arc(cx, by + bh * 0.16 + bh * 0.36, max(0.5, sh * 0.16), 0,
                2 * 3.14159265358979)
         cr.fill()
 
@@ -469,7 +592,7 @@ class StatusRing(Gtk.DrawingArea):
         radius = r * (0.985 + 0.02 * pulse)
         cr.set_source_rgba(*_hex(color, 0.22 + 0.5 * pulse))
         cr.set_line_width(5)
-        cr.arc(cx, cy, radius, 0, 2 * 3.14159265358979)
+        cr.arc(cx, cy, max(1.0, radius), 0, 2 * 3.14159265358979)
         cr.stroke()
 
     def _draw_sweep(self, cr, cx, cy, r, color, age) -> None:
@@ -491,33 +614,35 @@ class StatusRing(Gtk.DrawingArea):
         rr = r * scale
         cr.set_source_rgba(*_hex(color, 0.16 + 0.5 * bump))
         cr.set_line_width(13)
-        cr.arc(cx, cy, rr + 3, 0, 2 * 3.14159265358979)
+        cr.arc(cx, cy, max(1.0, rr + 3), 0, 2 * 3.14159265358979)
         cr.stroke()
         cr.set_source_rgba(*_hex(color, 1.0))
         cr.set_line_width(6)
-        cr.arc(cx, cy, rr, 0, 2 * 3.14159265358979)
+        cr.arc(cx, cy, max(1.0, rr), 0, 2 * 3.14159265358979)
         cr.stroke()
-        # check mark
-        span = r * 0.36
-        cr.set_line_width(max(2.5, span * 0.28))
-        cr.set_line_cap(cairo.LineCap.ROUND)
-        cr.set_line_join(cairo.LineJoin.ROUND)
-        cr.move_to(cx - span * 0.9, cy + span * 0.05)
-        cr.line_to(cx - span * 0.12, cy + span * 0.62)
-        cr.line_to(cx + span * 0.95, cy - span * 0.55)
-        cr.stroke()
+        if not self._success_surf:
+            # check mark fallback
+            span = r * 0.36
+            cr.set_line_width(max(2.5, span * 0.28))
+            cr.set_line_cap(cairo.LineCap.ROUND)
+            cr.set_line_join(cairo.LineJoin.ROUND)
+            cr.move_to(cx - span * 0.9, cy + span * 0.05)
+            cr.line_to(cx - span * 0.12, cy + span * 0.62)
+            cr.line_to(cx + span * 0.95, cy - span * 0.55)
+            cr.stroke()
 
     def _draw_error(self, cr, cx, cy, r, color, _age) -> None:
         cr.set_source_rgba(*_hex(color, 0.16))
         cr.set_line_width(13)
-        cr.arc(cx, cy, r + 3, 0, 2 * 3.14159265358979)
+        cr.arc(cx, cy, max(1.0, r + 3), 0, 2 * 3.14159265358979)
         cr.stroke()
         cr.set_source_rgba(*_hex(color, 1.0))
         cr.set_line_width(6)
-        cr.arc(cx, cy, r, 0, 2 * 3.14159265358979)
+        cr.arc(cx, cy, max(1.0, r), 0, 2 * 3.14159265358979)
         cr.stroke()
-        cr.arc(cx, cy, r * 0.16, 0, 2 * 3.14159265358979)
-        cr.fill()
+        if not self._failure_surf:
+            cr.arc(cx, cy, max(1.0, r * 0.16), 0, 2 * 3.14159265358979)
+            cr.fill()
 
 
 # ---------------------------------------------------------------------------
