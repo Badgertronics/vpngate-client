@@ -126,7 +126,25 @@ def build_pyinstaller(build_dir: Path, dist_dir: Path) -> Path:
     worker_binary = worker_dist / worker_exe_name
     if worker_binary.exists():
         shutil.copy2(str(worker_binary), str(out_dir / worker_exe_name))
-        os.chmod(str(out_dir / worker_exe_name), 0o755)
+        try:
+            os.chmod(str(out_dir / worker_exe_name), 0o755)
+        except OSError:
+            pass
+    # Ensure gdbus.exe is bundled on Windows to satisfy GIO win32 session bus
+    if sys.platform == "win32":
+        gdbus_candidates = [
+            shutil.which("gdbus"),
+            shutil.which("gdbus.exe"),
+            Path("C:/Program Files/msys64/ucrt64/bin/gdbus.exe"),
+            Path("C:/msys64/ucrt64/bin/gdbus.exe"),
+            Path("C:/msys64/mingw64/bin/gdbus.exe"),
+        ]
+        gdbus_bin = next((Path(p) for p in gdbus_candidates if p and Path(p).is_file()), None)
+        if gdbus_bin:
+            shutil.copy2(str(gdbus_bin), str(out_dir / "gdbus.exe"))
+            if (out_dir / "_internal").exists():
+                shutil.copy2(str(gdbus_bin), str(out_dir / "_internal" / "gdbus.exe"))
+            print(f"==> Bundled win32 session dbus helper: {gdbus_bin}")
 
     # Copy icons, desktop file, install.sh, data, README
     icons_src = APP_DIR / "icons"
@@ -233,10 +251,6 @@ def package_deb(source_dir: Path, output_deb: Path, deb_arch: str) -> None:
         "URL=https://github.com/Badgertronics/vpngate-client\n",
         encoding="utf-8"
     )
-    legacy_desktop = install_apps / "vpngate-gui.desktop"
-    if legacy_desktop.exists():
-        legacy_desktop.unlink()
-    legacy_desktop.symlink_to(Path("com.vpngate.client.desktop"))
 
     # AppStream metadata for App Center
     install_metainfo = deb_root / "usr" / "share" / "metainfo"
@@ -247,17 +261,21 @@ def package_deb(source_dir: Path, output_deb: Path, deb_arch: str) -> None:
         '<component type="desktop-application">\n'
         '  <id>com.vpngate.client</id>\n'
         '  <metadata_license>CC0-1.0</metadata_license>\n'
-        '  <project_license>GPL-3.0-or-later</project_license>\n'
+        '  <project_license>MIT</project_license>\n'
         '  <name>VPN Gate Client</name>\n'
-        '  <summary>Graphical VPN Gate client for Linux desktops</summary>\n'
+        '  <summary>Free graphical VPN Gate client for Linux desktops</summary>\n'
         '  <description>\n'
-        '    <p>Connect to the public free VPN servers of VPN Gate.</p>\n'
+        '    <p>Connect to the public free VPN servers of the University of Tsukuba VPN Gate project.</p>\n'
         '    <p>Supports SSL-VPN (SoftEther), L2TP/IPsec, MS-SSTP, and OpenVPN.</p>\n'
         '  </description>\n'
         '  <launchable type="desktop-id">com.vpngate.client.desktop</launchable>\n'
         '  <url type="homepage">https://github.com/Badgertronics/vpngate-client</url>\n'
         '  <url type="bugtracker">https://github.com/Badgertronics/vpngate-client/issues</url>\n'
         '  <url type="vcs-browser">https://github.com/Badgertronics/vpngate-client</url>\n'
+        '  <url type="help">https://github.com/Badgertronics/vpngate-client#readme</url>\n'
+        '  <developer id="com.vpngate.client">\n'
+        '    <name>Badgertronics</name>\n'
+        '  </developer>\n'
         '  <developer_name>Badgertronics</developer_name>\n'
         '</component>\n',
         encoding="utf-8"
@@ -287,7 +305,7 @@ def package_deb(source_dir: Path, output_deb: Path, deb_arch: str) -> None:
         encoding="utf-8"
     )
 
-    # postinst script to ensure proper sudoers file permission and ownership
+    # postinst script to ensure proper sudoers file permission and remove legacy duplicate desktop file
     postinst_file = debian_dir / "postinst"
     postinst_file.write_text(
         "#!/bin/sh\n"
@@ -295,6 +313,10 @@ def package_deb(source_dir: Path, output_deb: Path, deb_arch: str) -> None:
         "if [ -f /etc/sudoers.d/vpngate-client ]; then\n"
         "    chown root:root /etc/sudoers.d/vpngate-client\n"
         "    chmod 0440 /etc/sudoers.d/vpngate-client\n"
+        "fi\n"
+        "rm -f /usr/share/applications/vpngate-gui.desktop\n"
+        "if which update-desktop-database >/dev/null 2>&1; then\n"
+        "    update-desktop-database /usr/share/applications || true\n"
         "fi\n"
         "exit 0\n",
         encoding="utf-8"

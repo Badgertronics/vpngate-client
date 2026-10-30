@@ -27,6 +27,8 @@ from typing import Callable, Dict, List, Optional
 
 if sys.platform == "win32":
     os.environ.setdefault("GSK_RENDERER", "cairo")
+    os.environ.setdefault("GSETTINGS_BACKEND", "memory")
+    os.environ.setdefault("GIO_USE_VFS", "local")
 else:
     os.environ.setdefault("GSK_RENDERER", "gl")
 
@@ -37,7 +39,9 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gdk, Gio, Gtk, Pango  # noqa: E402
 
 from . import fetcher, privilege                      # noqa: E402
-from .config import (APP_NAME, DEFAULT_CONNECTIVITY_TARGETS, DEFAULT_MIRRORS,  # noqa: E402
+from .config import (APP_NAME, DEFAULT_CONNECT_RETRIES, DEFAULT_CONNECT_TIMEOUT,  # noqa: E402
+                     DEFAULT_CONNECTIVITY_TARGETS, DEFAULT_MIRRORS,
+                     DEFAULT_PROBE_TIMEOUT, DEFAULT_WATCHDOG_INTERVAL,
                      DEVELOPER_NAME, DONATE_BEP20, DONATE_BITCOIN,
                      DONATE_ETHEREUM, GITHUB_URL, STATE_DIR, VERSION)
 from .models import PROTOCOL_ORDER, Protocol, VpnServer  # noqa: E402
@@ -65,6 +69,25 @@ def _make_wrap_box(child_spacing: int = 6, line_spacing: int = 6, **kwargs) -> G
     if wrap_cls is not None:
         return wrap_cls(child_spacing=child_spacing, line_spacing=line_spacing, **kwargs)
     return Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=child_spacing, **kwargs)
+
+
+def _make_spin_row(title: str, subtitle: str, min_v: float, max_v: float, step: float, current: float, digits: int = 0) -> Gtk.Widget:
+    """Create an Adw.SpinRow (Libadwaita >= 1.2) or fallback to ActionRow with Gtk.SpinButton."""
+    if hasattr(Adw, "SpinRow"):
+        row = Adw.SpinRow.new_with_range(min_v, max_v, step)
+        row.set_title(title)
+        row.set_subtitle(subtitle)
+        row.set_digits(digits)
+        row.set_value(current)
+        return row
+    row = Adw.ActionRow(title=title, subtitle=subtitle)
+    adj = Gtk.Adjustment(value=current, lower=min_v, upper=max_v, step_increment=step, page_increment=step * 2)
+    spin = Gtk.SpinButton(adjustment=adj, digits=digits, valign=Gtk.Align.CENTER)
+    row.add_suffix(spin)
+    row.get_value = lambda: spin.get_value()
+    row.set_value = lambda v: spin.set_value(v)
+    row.connect = lambda sig, cb: spin.connect("value-changed", lambda s: cb(row, None))
+    return row
 
 
 class _SheetFallback(Gtk.Box):
@@ -239,7 +262,18 @@ def _server_from_dict(item: dict) -> VpnServer:
 # Sorting / recommendations
 # ---------------------------------------------------------------------------
 
-_SORT_MODES = ("recommended", "speed", "ping", "country")
+_SORT_MODES = (
+    "recommended",
+    "speed",
+    "ping",
+    "sessions_asc",
+    "sessions_desc",
+    "uptime",
+    "traffic",
+    "users",
+    "hostname",
+    "country",
+)
 
 
 def sort_servers(servers: List[VpnServer], mode: str) -> List[VpnServer]:
@@ -248,6 +282,18 @@ def sort_servers(servers: List[VpnServer], mode: str) -> List[VpnServer]:
         out.sort(key=lambda s: (-s.speed_mbps, s.ping_ms or 0))
     elif mode == "ping":
         out.sort(key=lambda s: (s.ping_ms or 99999, -s.speed_mbps))
+    elif mode == "sessions_asc":
+        out.sort(key=lambda s: (s.sessions, -s.speed_mbps))
+    elif mode == "sessions_desc":
+        out.sort(key=lambda s: (-s.sessions, -s.speed_mbps))
+    elif mode == "uptime":
+        out.sort(key=lambda s: (-getattr(s, "uptime_seconds", 0), -s.speed_mbps))
+    elif mode == "traffic":
+        out.sort(key=lambda s: (-getattr(s, "total_traffic_bytes", 0), -s.speed_mbps))
+    elif mode == "users":
+        out.sort(key=lambda s: (-s.total_users, -s.speed_mbps))
+    elif mode == "hostname":
+        out.sort(key=lambda s: ((s.hostname or s.ip).lower(), s.country))
     elif mode == "country":
         out.sort(key=lambda s: (s.country, s.country_code))
     else:                                              # "recommended"
@@ -742,8 +788,18 @@ class VpnGateWindow(Adw.ApplicationWindow):
                                 lambda *_: self._apply_filters())
         row_top.append(self.country_dd)
 
-        sort_items = [_("Recommended"), _("Fastest"), _("Lowest latency"),
-                      _("Country")]
+        sort_items = [
+            _("Recommended"),
+            _("Fastest speed"),
+            _("Lowest ping (latency)"),
+            _("Lowest sessions"),
+            _("Highest sessions"),
+            _("Longest uptime"),
+            _("Cumulative transfers (traffic)"),
+            _("Cumulative users"),
+            _("DDNS hostname"),
+            _("Country name"),
+        ]
         self.sort_dd = Gtk.DropDown.new(Gtk.StringList.new(sort_items), None)
         self.sort_dd.set_selected(0)
         self.sort_dd.connect("notify::selected-item", self._on_sort_changed)
@@ -1432,10 +1488,12 @@ class VpnGateWindow(Adw.ApplicationWindow):
             return
         self._aborting = False
         self._hide_chips()
-        self.selected = server
+        timeout = int(self.settings.get("connect_timeout", DEFAULT_CONNECT_TIMEOUT))
+        retries = int(self.settings.get("connect_retries", DEFAULT_CONNECT_RETRIES))
         if self.worker is not None and self.worker.poll() is None:
             self._send({"cmd": "connect", "protocol": protocol.value,
-                        "server": server.to_dict()})
+                        "server": server.to_dict(),
+                        "timeout": timeout, "retries": retries})
             self._set_state("connecting",
                             _("Dialing {host} via {proto} …").format(
                                 host=server.hostname or server.ip,
@@ -1445,16 +1503,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._start_authorization()
 
     def _abort_connect(self) -> None:
-        """Stop pressed while dialing/authorizing: return to the idle view.
-
-        Two cases:
-        * no helper yet (authorization in flight) — drop the pending dial,
-          close the password dialog if one is open, and go straight idle;
-        * helper alive and dialing — it cannot be interrupted mid-call, so
-          queue a disconnect command: the helper tears the tunnel down as
-          soon as the dial returns and its ``disconnected`` event brings the
-          UI back to idle.  In the meantime the panel reads "Stopping …".
-        """
+        """Stop pressed while dialing/authorizing: return to the idle view immediately."""
         if self.state not in ("connecting", "authorizing"):
             return
         self._aborting = True
@@ -1467,7 +1516,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
                 pass
         if self.worker is not None and self.worker.poll() is None:
             self.hero_sub.set_text(_("Stopping …"))
-            self._send({"cmd": "disconnect"})
+            self._send({"cmd": "abort"})
         else:
             self._aborting = False
             self._set_state("idle", _("Connection attempt stopped."))
@@ -1789,7 +1838,8 @@ class VpnGateWindow(Adw.ApplicationWindow):
                 t=f"{hours:02d}:{minutes:02d}:{seconds:02d}"))
 
             now = time.time()
-            if not self._watchdog_in_flight and (now - self._watchdog_last_check) >= 4.0:
+            interval = float(self.settings.get("watchdog_interval", DEFAULT_WATCHDOG_INTERVAL))
+            if not self._watchdog_in_flight and (now - self._watchdog_last_check) >= interval:
                 self._watchdog_last_check = now
                 self._watchdog_in_flight = True
                 threading.Thread(target=self._run_watchdog_probe, daemon=True).start()
@@ -1800,9 +1850,10 @@ class VpnGateWindow(Adw.ApplicationWindow):
         success = False
         reached_target = None
         rtt_ms = 0
+        probe_timeout = float(self.settings.get("probe_timeout", DEFAULT_PROBE_TIMEOUT))
         for target in targets:
             t0 = time.time()
-            if probe_target(target, timeout=2.5):
+            if probe_target(target, timeout=probe_timeout):
                 success = True
                 reached_target = target
                 rtt_ms = max(1, int((time.time() - t0) * 1000))
@@ -1919,6 +1970,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         dialog = Adw.PreferencesDialog()
         dialog.props.title = _("Settings")
         dialog.add(self._appearance_page())
+        dialog.add(self._timeouts_page(dialog))
         dialog.add(self._connectivity_page(dialog))
         dialog.add(self._mirrors_page(dialog))
         dialog.add(self._support_page(dialog))
@@ -1947,6 +1999,99 @@ class VpnGateWindow(Adw.ApplicationWindow):
         row.connect("notify::selected", changed)
         group.add(row)
         page.add(group)
+        return page
+
+    def _timeouts_page(self, dialog: Optional[Adw.PreferencesDialog] = None) -> Adw.PreferencesPage:
+        page = Adw.PreferencesPage(title=_("Timeouts & Retries"),
+                                   icon_name="preferences-system-time-symbolic")
+
+        group = Adw.PreferencesGroup(
+            title=_("Connection Timeouts & Attempts"),
+            description=_("Adjust waiting periods and retry behavior for tunnel dials and probes."))
+
+        current_timeout = float(self.settings.get("connect_timeout", DEFAULT_CONNECT_TIMEOUT))
+        row_timeout = _make_spin_row(
+            _("Connection timeout (seconds)"),
+            _("Time to wait for a tunnel dial before giving up or retrying"),
+            10.0, 120.0, 5.0, current_timeout, digits=0)
+
+        def on_timeout_changed(row, _param) -> None:
+            self.settings["connect_timeout"] = int(row.get_value())
+            save_settings(self.settings)
+
+        row_timeout.connect("notify::value", on_timeout_changed)
+        group.add(row_timeout)
+
+        current_retries = float(self.settings.get("connect_retries", DEFAULT_CONNECT_RETRIES))
+        row_retries = _make_spin_row(
+            _("Dial attempts (retries)"),
+            _("Maximum number of times to try establishing a connection to the selected relay"),
+            1.0, 5.0, 1.0, current_retries, digits=0)
+
+        def on_retries_changed(row, _param) -> None:
+            self.settings["connect_retries"] = int(row.get_value())
+            save_settings(self.settings)
+
+        row_retries.connect("notify::value", on_retries_changed)
+        group.add(row_retries)
+
+        current_probe = float(self.settings.get("probe_timeout", DEFAULT_PROBE_TIMEOUT))
+        row_probe = _make_spin_row(
+            _("Connectivity probe timeout (seconds)"),
+            _("Timeout for each individual network reachability check"),
+            1.0, 15.0, 0.5, current_probe, digits=1)
+
+        def on_probe_changed(row, _param) -> None:
+            self.settings["probe_timeout"] = round(float(row.get_value()), 1)
+            save_settings(self.settings)
+
+        row_probe.connect("notify::value", on_probe_changed)
+        group.add(row_probe)
+
+        current_interval = float(self.settings.get("watchdog_interval", DEFAULT_WATCHDOG_INTERVAL))
+        row_interval = _make_spin_row(
+            _("Watchdog check interval (seconds)"),
+            _("How often to verify Internet traffic while connected"),
+            5.0, 60.0, 5.0, current_interval, digits=0)
+
+        def on_interval_changed(row, _param) -> None:
+            self.settings["watchdog_interval"] = int(row.get_value())
+            save_settings(self.settings)
+
+        row_interval.connect("notify::value", on_interval_changed)
+        group.add(row_interval)
+
+        page.add(group)
+
+        reset_group = Adw.PreferencesGroup()
+        reset_row = Adw.ActionRow(
+            title=_("Reset timeouts"),
+            subtitle=_("Restore default timeouts and retry counts"))
+        reset_btn = Gtk.Button(label=_("Reset to defaults"),
+                               css_classes=["flat", "destructive"],
+                               valign=Gtk.Align.CENTER)
+
+        def on_reset_clicked(_btn) -> None:
+            self.settings["connect_timeout"] = DEFAULT_CONNECT_TIMEOUT
+            self.settings["connect_retries"] = DEFAULT_CONNECT_RETRIES
+            self.settings["probe_timeout"] = DEFAULT_PROBE_TIMEOUT
+            self.settings["watchdog_interval"] = DEFAULT_WATCHDOG_INTERVAL
+            save_settings(self.settings)
+            row_timeout.set_value(DEFAULT_CONNECT_TIMEOUT)
+            row_retries.set_value(DEFAULT_CONNECT_RETRIES)
+            row_probe.set_value(DEFAULT_PROBE_TIMEOUT)
+            row_interval.set_value(DEFAULT_WATCHDOG_INTERVAL)
+            toast = Adw.Toast.new(_("Default timeouts and retries restored"))
+            if dialog is not None and hasattr(dialog, "add_toast"):
+                dialog.add_toast(toast)
+            else:
+                self.toast(_("Default timeouts and retries restored"))
+
+        reset_btn.connect("clicked", on_reset_clicked)
+        reset_row.add_suffix(reset_btn)
+        reset_group.add(reset_row)
+        page.add(reset_group)
+
         return page
 
     def _connectivity_page(self, dialog: Optional[Adw.PreferencesDialog] = None) -> Adw.PreferencesPage:

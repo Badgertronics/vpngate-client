@@ -55,20 +55,48 @@ class Backend:
         raise NotImplementedError
 
     def connect(self, server: VpnServer, protocol: Protocol, emit: Emit,
-                workdir: str) -> dict:
+                workdir: str, timeout: int = 30, retries: int = 1) -> dict:
         raise NotImplementedError
 
     def disconnect(self, info: dict, emit: Emit) -> None:
         raise NotImplementedError
+
+    def abort(self, emit: Emit) -> None:
+        """Abort any in-flight dial attempt immediately."""
+        pass
 
 
 # ---------------------------------------------------------------------------
 # OpenVPN
 # ---------------------------------------------------------------------------
 
-class OpenVpnBackend:
+class OpenVpnBackend(Backend):
     name = "OpenVPN"
     supports = (Protocol.OPENVPN,)
+
+    def __init__(self) -> None:
+        self._active_proc: Optional[subprocess.Popen] = None
+        self._active_detail: dict = {}
+        self._abort_requested = False
+        self._last_openvpn_connect_id = ""
+
+    def abort(self, emit: Emit) -> None:
+        self._abort_requested = True
+        proc = self._active_proc
+        if proc is not None:
+            _log_emit(emit, "Aborting OpenVPN process ...")
+            self._terminate(proc)
+            self._active_proc = None
+        detail = getattr(self, "_active_detail", {})
+        openvpn_bin = detail.get("bin") or self._openvpn_bin()
+        if sys.platform == "win32" and (detail.get("is_connect") or self._is_connect(openvpn_bin)):
+            profile_id = detail.get("profile_id") or getattr(self, "_last_openvpn_connect_id", "")
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.run([openvpn_bin, "--disconnect-shortcut"], check=False,
+                           creationflags=creation_flags)
+            if profile_id:
+                subprocess.run([openvpn_bin, f"--remove-profile={profile_id}"], check=False,
+                               creationflags=creation_flags)
 
     def available(self) -> bool:
         if sys.platform == "win32":
@@ -184,12 +212,13 @@ class OpenVpnBackend:
 
     # -- connect / disconnect --------------------------------------------
     def connect(self, server: VpnServer, protocol: Protocol, emit: Emit,
-                workdir: str) -> dict:
+                workdir: str, timeout: int = 30, retries: int = 1) -> dict:
+        self._abort_requested = False
         config = self.build_config(server, workdir, emit)
         openvpn_bin = self._openvpn_bin() or "openvpn"
         if sys.platform == "win32" and self._is_connect(openvpn_bin):
             return self._connect_openvpn_connect(server, protocol, emit, workdir,
-                                                 config, openvpn_bin)
+                                                 config, openvpn_bin, timeout=timeout)
 
         cmd = [
             openvpn_bin, "--config", config,
@@ -208,12 +237,15 @@ class OpenVpnBackend:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True,
                                 bufsize=1, creationflags=creation_flags, env=env)
-        deadline = time.time() + CONNECT_TIMEOUT
+        self._active_proc = proc
+        deadline = time.time() + timeout
         connected = False
         lines: List[str] = []
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
+                if self._abort_requested:
+                    break
                 line = line.rstrip()
                 if not line:
                     continue
@@ -229,6 +261,12 @@ class OpenVpnBackend:
         except BackendError:
             self._terminate(proc)
             raise
+        finally:
+            self._active_proc = None
+
+        if self._abort_requested:
+            self._terminate(proc)
+            raise BackendError("Connection aborted by user.")
         if not connected:
             self._terminate(proc)
             tail = "\n".join(lines[-6:])
@@ -439,7 +477,7 @@ class OpenVpnBackend:
 # SSL-VPN (SoftEther VPN client)
 # ---------------------------------------------------------------------------
 
-class SoftEtherBackend:
+class SoftEtherBackend(Backend):
     name = "SSL-VPN (SoftEther)"
     supports = (Protocol.SSLVP,)
 
@@ -447,6 +485,14 @@ class SoftEtherBackend:
     SERVICE = "/usr/libexec/softether/vpnclient/vpnclient"
     ACCOUNT = "vpngate"
     NIC = "VPN"                             # virtual adapter name
+
+    def __init__(self) -> None:
+        self._abort_requested = False
+
+    def abort(self, emit: Emit) -> None:
+        self._abort_requested = True
+        _log_emit(emit, "Aborting SoftEther connection ...")
+        self._run_commands([f"AccountDisconnect {self.ACCOUNT}", f"AccountDelete {self.ACCOUNT}"], timeout=10)
 
     def available(self) -> bool:
         if sys.platform == "win32":
@@ -573,7 +619,8 @@ class SoftEtherBackend:
                     timeout=10)
 
     def connect(self, server: VpnServer, protocol: Protocol, emit: Emit,
-                workdir: str) -> dict:
+                workdir: str, timeout: int = 30, retries: int = 1) -> dict:
+        self._abort_requested = False
         if sys.platform == "win32":
             return self._connect_windows(server, protocol, emit, workdir)
 
@@ -590,13 +637,15 @@ class SoftEtherBackend:
                         "device and virtual adapters are clean ...")
         self._hard_start(emit)
 
+        retries = max(1, retries)
         last_error = ""
-        for attempt in (1, 2):
-            if attempt == 2:
-                _log_emit(emit, "[sslvpn] second attempt after another full "
-                                "daemon restart ...")
+        for attempt in range(1, retries + 1):
+            if self._abort_requested:
+                break
+            if attempt > 1:
+                _log_emit(emit, f"[sslvpn] attempt {attempt}/{retries} after another full daemon restart ...")
                 self._hard_start(emit)
-            _log_emit(emit, f"[sslvpn 3/5] Dial attempt {attempt}/2 -> {target} "
+            _log_emit(emit, f"[sslvpn 3/5] Dial attempt {attempt}/{retries} -> {target} "
                             "(fresh virtual NIC + account)")
             self._reset_nic(self.NIC, emit)
             commands = [
@@ -611,16 +660,20 @@ class SoftEtherBackend:
                 f"AccountStatusHide {self.ACCOUNT}",
                 f"AccountConnect {self.ACCOUNT}",
             ]
-            self._run_commands(commands, timeout=90)
+            self._run_commands(commands, timeout=min(timeout, 90))
             if self._session_and_adapter(emit):
                 break
             last_error = "the session or the virtual adapter did not come up"
             self._run_commands([f"AccountDisconnect {self.ACCOUNT}"],
-                               timeout=40)
+                               timeout=min(timeout, 40))
         else:
-            self._run_commands([f"AccountDelete {self.ACCOUNT}"], timeout=40)
-            raise BackendError(f"The SSL-VPN session was not established "
-                               f"({last_error}).")
+            if not self._abort_requested:
+                self._run_commands([f"AccountDelete {self.ACCOUNT}"], timeout=40)
+                raise BackendError(f"The SSL-VPN session was not established ({last_error}).")
+
+        if self._abort_requested:
+            self.abort(emit)
+            raise BackendError("Connection aborted by user.")
 
         nic = self.NIC
         iface = self._iface()
@@ -884,9 +937,41 @@ def _cleanup_windows_ras(vpn_name: str, target_ips: Optional[set] = None) -> Non
 # MS-SSTP
 # ---------------------------------------------------------------------------
 
-class SstpBackend:
+class SstpBackend(Backend):
     name = "MS-SSTP"
     supports = (Protocol.SSTP,)
+
+    def __init__(self) -> None:
+        self._active_proc: Optional[subprocess.Popen] = None
+        self._abort_requested = False
+        self._active_vpn_name = "VPNGate"
+        self._active_target_ips: set = set()
+
+    def abort(self, emit: Emit) -> None:
+        self._abort_requested = True
+        proc = self._active_proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.kill()
+            except Exception:
+                pass
+        self._active_proc = None
+        if sys.platform == "win32":
+            vpn_name = getattr(self, "_active_vpn_name", "VPNGate")
+            target_ips = getattr(self, "_active_target_ips", set())
+            _log_emit(emit, f"Aborting Windows MS-SSTP connection {vpn_name} ...")
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            try:
+                subprocess.run(["rasdial", vpn_name, "/disconnect"],
+                               capture_output=True, timeout=5, creationflags=creation_flags)
+                subprocess.run(["rasphone", "-h", vpn_name],
+                               capture_output=True, timeout=5, creationflags=creation_flags)
+            except Exception:
+                pass
+            _cleanup_windows_ras(vpn_name, target_ips)
+        else:
+            netutil.run(["pkill", "-f", "sstpc"], timeout=10)
 
     def available(self) -> bool:
         if sys.platform == "win32":
@@ -929,7 +1014,7 @@ class SstpBackend:
                 pass
 
     def _connect_windows(self, server: VpnServer, protocol: Protocol, emit: Emit,
-                         workdir: str) -> dict:
+                         workdir: str, timeout: int = 30, retries: int = 1) -> dict:
         host = server.sstp_host or server.hostname or server.ip
         if host and "." not in host:
             host = f"{host}.opengw.net"
@@ -949,9 +1034,10 @@ class SstpBackend:
             f"-EncryptionLevel Optional -AuthenticationMethod Pap,Chap,MSChapv2 "
             f"-SplitTunneling:$false -Force"
         )
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         res = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_add],
-            capture_output=True, text=True, timeout=30
+            capture_output=True, text=True, timeout=30, creationflags=creation_flags
         )
         if res.returncode != 0:
             err = res.stderr.strip() or res.stdout.strip()
@@ -973,28 +1059,68 @@ class SstpBackend:
             for tip in target_ips:
                 _log_emit(emit, f"[sstp] Routing {tip}/32 via physical gateway {physical_gw} ...")
                 subprocess.run(["route", "add", tip, "mask", "255.255.255.255", physical_gw, "metric", "1"],
-                               capture_output=True, text=True, timeout=10)
+                               capture_output=True, text=True, timeout=10, creationflags=creation_flags)
 
         _log_emit(emit, f"[sstp 2/3] Dialing {vpn_name} ({host}) via Windows RAS ...")
-        try:
-            dial_res = subprocess.run(
-                ["rasdial", vpn_name, VPN_USERNAME, VPN_PASSWORD],
-                capture_output=True, text=True, timeout=45
-            )
-            output = (dial_res.stdout or "") + (dial_res.stderr or "")
-        except subprocess.TimeoutExpired:
-            _cleanup_windows_ras(vpn_name, target_ips)
-            raise BackendError(f"Windows RAS connection to {host} timed out after 45 seconds.")
+        self._abort_requested = False
+        self._active_vpn_name = vpn_name
+        self._active_target_ips = target_ips
 
-        for line in output.splitlines():
-            line = line.strip()
-            if line:
-                _log_emit(emit, f"[rasdial] {line}")
+        retries = max(1, retries)
+        output = ""
+        last_error = ""
+        for attempt in range(1, retries + 1):
+            if self._abort_requested:
+                break
+            if attempt > 1:
+                _log_emit(emit, f"[sstp] Dial attempt {attempt}/{retries} ...")
 
-        if dial_res.returncode != 0 or "successfully connected" not in output.lower():
-            _cleanup_windows_ras(vpn_name, target_ips)
-            last_line = output.strip().splitlines()[-1] if output.strip() else "connection failed"
-            raise BackendError(f"MS-SSTP connection failed: {last_line}")
+            try:
+                proc = subprocess.Popen(
+                    ["rasdial", vpn_name, VPN_USERNAME, VPN_PASSWORD],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    creationflags=creation_flags
+                )
+                self._active_proc = proc
+                out, err = proc.communicate(timeout=timeout)
+                output = (out or "") + (err or "")
+            except subprocess.TimeoutExpired:
+                if proc:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                last_error = f"timed out after {timeout} seconds"
+                _log_emit(emit, f"[rasdial] Attempt {attempt} timed out after {timeout} seconds.")
+                if attempt < retries and not self._abort_requested:
+                    time.sleep(1.5)
+                continue
+            finally:
+                self._active_proc = None
+
+            if self._abort_requested:
+                break
+
+            for line in output.splitlines():
+                line = line.strip()
+                if line:
+                    _log_emit(emit, f"[rasdial] {line}")
+
+            if proc.returncode == 0 and "successfully connected" in output.lower():
+                break
+
+            last_error = output.strip().splitlines()[-1] if output.strip() else "connection failed"
+            if attempt < retries and not self._abort_requested:
+                _log_emit(emit, f"[sstp] Attempt {attempt}/{retries} failed ({last_error}), retrying ...")
+                time.sleep(1.5)
+        else:
+            if not self._abort_requested:
+                _cleanup_windows_ras(vpn_name, target_ips)
+                raise BackendError(f"MS-SSTP connection failed: {last_error}")
+
+        if self._abort_requested:
+            self.abort(emit)
+            raise BackendError("Connection aborted by user.")
 
         subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command",
@@ -1043,9 +1169,10 @@ class SstpBackend:
         return options
 
     def connect(self, server: VpnServer, protocol: Protocol, emit: Emit,
-                workdir: str) -> dict:
+                workdir: str, timeout: int = 30, retries: int = 1) -> dict:
+        self._abort_requested = False
         if sys.platform == "win32":
-            return self._connect_windows(server, protocol, emit, workdir)
+            return self._connect_windows(server, protocol, emit, workdir, timeout=timeout, retries=retries)
         port = server.sstp_port
         if not port:
             raise BackendError("This server does not offer the MS-SSTP service.")
@@ -1069,20 +1196,30 @@ class SstpBackend:
             proc = subprocess.Popen(cmd, stdout=logfile, stderr=logfile,
                                     stdin=subprocess.DEVNULL, env=env)
 
-        deadline = time.time() + CONNECT_TIMEOUT
+        self._active_proc = proc
+        deadline = time.time() + timeout
         iface = ""
         tick = 0
-        while time.time() < deadline:
-            iface = self._ppp_interface()
-            if iface and netutil.interface_ipv4(iface):
-                break
-            if proc.poll() is not None:
-                break
-            tick += 1
-            if tick % 5 == 0:                     # every ~10 s
-                _log_emit(emit, f"[sstp] waiting for the ppp handshake "
-                                f"({_since(started)} elapsed) ...")
-            time.sleep(2)
+        try:
+            while time.time() < deadline:
+                if self._abort_requested:
+                    break
+                iface = self._ppp_interface()
+                if iface and netutil.interface_ipv4(iface):
+                    break
+                if proc.poll() is not None:
+                    break
+                tick += 1
+                if tick % 5 == 0:                     # every ~10 s
+                    _log_emit(emit, f"[sstp] waiting for the ppp handshake "
+                                    f"({_since(started)} elapsed) ...")
+                time.sleep(2)
+        finally:
+            self._active_proc = None
+
+        if self._abort_requested:
+            proc.terminate()
+            raise BackendError("Connection aborted by user.")
 
         if not iface or not netutil.interface_ipv4(iface):
             proc.terminate()
@@ -1175,7 +1312,7 @@ class SstpBackend:
 # L2TP / IPsec
 # ---------------------------------------------------------------------------
 
-class L2tpBackend:
+class L2tpBackend(Backend):
     name = "L2TP/IPsec"
     supports = (Protocol.L2TP,)
 
@@ -1193,13 +1330,47 @@ class L2tpBackend:
     _charon_proc = None                     # set when we spawn charon ourselves
     _fixer_proc = None                      # UDP-checksum fixer daemon
 
+    def __init__(self) -> None:
+        self._active_proc: Optional[subprocess.Popen] = None
+        self._abort_requested = False
+        self._active_vpn_name = "VPNGate"
+        self._active_target_ips: set = set()
+
+    def abort(self, emit: Emit) -> None:
+        self._abort_requested = True
+        proc = self._active_proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.kill()
+            except Exception:
+                pass
+        self._active_proc = None
+        if sys.platform == "win32":
+            vpn_name = getattr(self, "_active_vpn_name", "VPNGate")
+            target_ips = getattr(self, "_active_target_ips", set())
+            _log_emit(emit, f"Aborting Windows L2TP/IPsec connection {vpn_name} ...")
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            try:
+                subprocess.run(["rasdial", vpn_name, "/disconnect"],
+                               capture_output=True, timeout=5, creationflags=creation_flags)
+                subprocess.run(["rasphone", "-h", vpn_name],
+                               capture_output=True, timeout=5, creationflags=creation_flags)
+            except Exception:
+                pass
+            _cleanup_windows_ras(vpn_name, target_ips)
+        else:
+            netutil.run(["pkill", "-f", "xl2tpd"], timeout=10)
+            self._ipsec_down()
+            self._remove_fixer()
+
     def available(self) -> bool:
         if sys.platform == "win32":
             return bool(shutil.which("rasdial") or os.path.exists(r"C:\Windows\System32\rasdial.exe"))
         return bool(netutil.which("xl2tpd")) and bool(netutil.which("swanctl"))
 
     def _connect_windows(self, server: VpnServer, protocol: Protocol, emit: Emit,
-                         workdir: str) -> dict:
+                         workdir: str, timeout: int = 30, retries: int = 1) -> dict:
         host = server.ip or server.hostname
         vpn_name = "VPNGate"
         _log_emit(emit, f"[l2tp 1/3] Configuring native Windows L2TP/IPsec connection to {host} ...")
@@ -1216,9 +1387,10 @@ class L2tpBackend:
             f"-L2tpPsk '{VPN_PSK}' -EncryptionLevel Optional -AuthenticationMethod Pap,Chap,MSChapv2 "
             f"-SplitTunneling:$false -Force"
         )
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         res = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_add],
-            capture_output=True, text=True, timeout=30
+            capture_output=True, text=True, timeout=30, creationflags=creation_flags
         )
         if res.returncode != 0:
             err = res.stderr.strip() or res.stdout.strip()
@@ -1240,33 +1412,73 @@ class L2tpBackend:
             for tip in target_ips:
                 _log_emit(emit, f"[l2tp] Routing {tip}/32 via physical gateway {physical_gw} ...")
                 subprocess.run(["route", "add", tip, "mask", "255.255.255.255", physical_gw, "metric", "1"],
-                               capture_output=True, text=True, timeout=10)
+                               capture_output=True, text=True, timeout=10, creationflags=creation_flags)
 
         _log_emit(emit, f"[l2tp 2/3] Dialing {vpn_name} ({host}) via Windows RAS with PSK ...")
-        try:
-            dial_res = subprocess.run(
-                ["rasdial", vpn_name, VPN_USERNAME, VPN_PASSWORD],
-                capture_output=True, text=True, timeout=45
-            )
-            output = (dial_res.stdout or "") + (dial_res.stderr or "")
-        except subprocess.TimeoutExpired:
-            _cleanup_windows_ras(vpn_name, target_ips)
-            raise BackendError(f"Windows RAS connection to {host} timed out after 45 seconds.")
+        self._abort_requested = False
+        self._active_vpn_name = vpn_name
+        self._active_target_ips = target_ips
 
-        for line in output.splitlines():
-            line = line.strip()
-            if line:
-                _log_emit(emit, f"[rasdial] {line}")
+        retries = max(1, retries)
+        output = ""
+        last_error = ""
+        for attempt in range(1, retries + 1):
+            if self._abort_requested:
+                break
+            if attempt > 1:
+                _log_emit(emit, f"[l2tp] Dial attempt {attempt}/{retries} ...")
 
-        if dial_res.returncode != 0 or "successfully connected" not in output.lower():
-            _cleanup_windows_ras(vpn_name, target_ips)
-            last_line = output.strip().splitlines()[-1] if output.strip() else "connection failed"
-            raise BackendError(f"L2TP/IPsec connection failed: {last_line}")
+            try:
+                proc = subprocess.Popen(
+                    ["rasdial", vpn_name, VPN_USERNAME, VPN_PASSWORD],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    creationflags=creation_flags
+                )
+                self._active_proc = proc
+                out, err = proc.communicate(timeout=timeout)
+                output = (out or "") + (err or "")
+            except subprocess.TimeoutExpired:
+                if proc:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                last_error = f"timed out after {timeout} seconds"
+                _log_emit(emit, f"[rasdial] Attempt {attempt} timed out after {timeout} seconds.")
+                if attempt < retries and not self._abort_requested:
+                    time.sleep(1.5)
+                continue
+            finally:
+                self._active_proc = None
+
+            if self._abort_requested:
+                break
+
+            for line in output.splitlines():
+                line = line.strip()
+                if line:
+                    _log_emit(emit, f"[rasdial] {line}")
+
+            if proc.returncode == 0 and "successfully connected" in output.lower():
+                break
+
+            last_error = output.strip().splitlines()[-1] if output.strip() else "connection failed"
+            if attempt < retries and not self._abort_requested:
+                _log_emit(emit, f"[l2tp] Attempt {attempt}/{retries} failed ({last_error}), retrying ...")
+                time.sleep(1.5)
+        else:
+            if not self._abort_requested:
+                _cleanup_windows_ras(vpn_name, target_ips)
+                raise BackendError(f"L2TP/IPsec connection failed: {last_error}")
+
+        if self._abort_requested:
+            self.abort(emit)
+            raise BackendError("Connection aborted by user.")
 
         subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command",
              f"Set-NetIPInterface -InterfaceAlias '{vpn_name}' -InterfaceMetric 1 -ErrorAction SilentlyContinue"],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, timeout=10, creationflags=creation_flags
         )
 
         _log_emit(emit, f"[l2tp 3/3] Connected in {_since(started)}: Windows L2TP/IPsec tunnel is active")
@@ -1530,9 +1742,10 @@ class L2tpBackend:
             handle.write(f"c {self.LAC_NAME}\n")
 
     def connect(self, server: VpnServer, protocol: Protocol, emit: Emit,
-                workdir: str) -> dict:
+                workdir: str, timeout: int = 30, retries: int = 1) -> dict:
+        self._abort_requested = False
         if sys.platform == "win32":
-            return self._connect_windows(server, protocol, emit, workdir)
+            return self._connect_windows(server, protocol, emit, workdir, timeout=timeout, retries=retries)
         started = time.monotonic()
         _log_emit(emit, f"[l2tp 1/5] Writing the L2TP/PPP definitions for "
                         f"{server.ip}:1701 (IKE PSK is the fixed 'vpn') ...")
@@ -1563,20 +1776,32 @@ class L2tpBackend:
         except OSError:
             pass
 
-        deadline = time.time() + self.CONNECT_TIMEOUT
+        self._active_proc = proc
+        deadline = time.time() + timeout
         iface = ""
         tick = 0
-        while time.time() < deadline:
-            iface = self._ppp_interface()
-            if iface and netutil.interface_ipv4(iface):
-                break
-            if proc.poll() is not None:
-                break
-            tick += 1
-            if tick % 5 == 0:                     # every ~10 s
-                _log_emit(emit, f"[l2tp] waiting for the ppp handshake over "
-                                f"ESP ({_since(started)} elapsed) ...")
-            time.sleep(2)
+        try:
+            while time.time() < deadline:
+                if self._abort_requested:
+                    break
+                iface = self._ppp_interface()
+                if iface and netutil.interface_ipv4(iface):
+                    break
+                if proc.poll() is not None:
+                    break
+                tick += 1
+                if tick % 5 == 0:                     # every ~10 s
+                    _log_emit(emit, f"[l2tp] waiting for the ppp handshake over "
+                                    f"ESP ({_since(started)} elapsed) ...")
+                time.sleep(2)
+        finally:
+            self._active_proc = None
+
+        if self._abort_requested:
+            proc.terminate()
+            self._ipsec_down()
+            self._remove_fixer()
+            raise BackendError("Connection aborted by user.")
 
         if not iface or not netutil.interface_ipv4(iface):
             proc.terminate()

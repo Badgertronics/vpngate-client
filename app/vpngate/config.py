@@ -3,7 +3,7 @@ import sys
 
 APP_NAME = "VPN Gate Client"
 APP_ID = "com.vpngate.client"
-VERSION = "1.0.15"
+VERSION = "1.0.16"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -102,7 +102,13 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
-# Seconds to wait for a tunnel to come up before giving up.
+# Default timeout and retry parameters (configurable in Settings)
+DEFAULT_CONNECT_TIMEOUT = 30           # Seconds to wait for a tunnel dial before giving up
+DEFAULT_CONNECT_RETRIES = 1           # Number of dial attempts before giving up
+DEFAULT_PROBE_TIMEOUT = 3.5           # Timeout in seconds for individual ping/HTTP probes
+DEFAULT_WATCHDOG_INTERVAL = 20        # Interval in seconds between background watchdog probes
+
+# Seconds to wait for a tunnel to come up before giving up (legacy fallback).
 CONNECT_TIMEOUT = 45
 # Seconds to wait for a SoftEther session to be established.
 SOFTETHER_TIMEOUT = 60

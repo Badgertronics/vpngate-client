@@ -137,6 +137,46 @@ def _parse_host_cell(cell: str) -> Tuple[str, str, str]:
     return host, ip, isp
 
 
+def _parse_uptime_to_seconds(uptime_str: str) -> int:
+    if not uptime_str:
+        return 0
+    m = re.search(r"(\d+)\s*(days?|hours?|mins?|minutes?|months?|weeks?)", uptime_str, re.I)
+    if not m:
+        return 0
+    val = int(m.group(1))
+    unit = m.group(2).lower()
+    if unit.startswith("day"):
+        return val * 86400
+    if unit.startswith("hour"):
+        return val * 3600
+    if unit.startswith("min"):
+        return val * 60
+    if unit.startswith("week"):
+        return val * 604800
+    if unit.startswith("month"):
+        return val * 2592000
+    return val
+
+
+def _parse_traffic_to_bytes(traffic_str: str) -> int:
+    if not traffic_str:
+        return 0
+    m = re.search(r"([\d,]+\.?\d*)\s*(GB|MB|KB|TB|bytes)", traffic_str, re.I)
+    if not m:
+        return 0
+    val = _float(m.group(1))
+    unit = m.group(2).upper()
+    if unit == "TB":
+        return int(val * (1024**4))
+    if unit == "GB":
+        return int(val * (1024**3))
+    if unit == "MB":
+        return int(val * (1024**2))
+    if unit == "KB":
+        return int(val * 1024)
+    return int(val)
+
+
 def _parse_sessions(cell: str) -> Tuple[int, str, int]:
     text = _text(cell)
     m = re.search(r"([\d,]+)\s+sessions", text, re.I)
@@ -273,10 +313,12 @@ def parse_server_table(document: str, mirror: str = "") -> List[VpnServer]:
                 isp_hostname=isp,
                 sessions=sessions,
                 uptime=uptime,
+                uptime_seconds=_parse_uptime_to_seconds(uptime),
                 total_users=users,
                 speed_mbps=speed,
                 ping_ms=ping,
                 total_traffic=traffic,
+                total_traffic_bytes=_parse_traffic_to_bytes(traffic),
                 log_policy=policy,
                 operator=operator,
                 score=score,
@@ -314,6 +356,26 @@ def parse_csv(csv_text: str) -> Dict[str, VpnServer]:
         if len(row) < 15 or not row[0] or row[0].startswith(("#", "*")):
             continue
         host, ip = row[0], row[1]
+        uptime_ms = _int(row[8]) if len(row) > 8 else 0
+        uptime_sec = uptime_ms // 1000 if uptime_ms > 0 else 0
+        total_traffic_bytes = _int(row[10]) if len(row) > 10 else 0
+
+        uptime_text = ""
+        if uptime_sec >= 86400:
+            uptime_text = f"{uptime_sec // 86400} days"
+        elif uptime_sec >= 3600:
+            uptime_text = f"{uptime_sec // 3600} hours"
+        elif uptime_sec >= 60:
+            uptime_text = f"{uptime_sec // 60} mins"
+
+        traffic_text = ""
+        if total_traffic_bytes >= (1024**4):
+            traffic_text = f"{total_traffic_bytes / (1024**4):.2f} TB"
+        elif total_traffic_bytes >= (1024**3):
+            traffic_text = f"{total_traffic_bytes / (1024**3):.2f} GB"
+        elif total_traffic_bytes >= (1024**2):
+            traffic_text = f"{total_traffic_bytes / (1024**2):.2f} MB"
+
         server = VpnServer(
             country=row[5],
             country_code=row[6],
@@ -323,7 +385,11 @@ def parse_csv(csv_text: str) -> Dict[str, VpnServer]:
             ping_ms=_int(row[3]),
             speed_mbps=_float(row[4]) / 1_000_000.0,
             sessions=_int(row[7]),
+            uptime=uptime_text,
+            uptime_seconds=uptime_sec,
             total_users=_int(row[9]),
+            total_traffic=traffic_text,
+            total_traffic_bytes=total_traffic_bytes,
             log_policy=row[11],
             operator=row[12],
             openvpn_config_b64=row[14] or "",
@@ -354,6 +420,18 @@ def merge_openvpn_configs(servers: List[VpnServer],
             server.speed_mbps = extra.speed_mbps
         if not server.operator:
             server.operator = extra.operator
+        if extra.uptime_seconds and not server.uptime_seconds:
+            server.uptime_seconds = extra.uptime_seconds
+        if extra.total_traffic_bytes and not server.total_traffic_bytes:
+            server.total_traffic_bytes = extra.total_traffic_bytes
+        if not server.uptime and extra.uptime:
+            server.uptime = extra.uptime
+        if not server.total_traffic and extra.total_traffic:
+            server.total_traffic = extra.total_traffic
+        if not server.sessions and extra.sessions:
+            server.sessions = extra.sessions
+        if not server.total_users and extra.total_users:
+            server.total_users = extra.total_users
     return servers
 
 

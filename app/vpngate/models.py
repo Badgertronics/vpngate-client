@@ -87,10 +87,12 @@ class VpnServer:
     isp_hostname: str = ""
     sessions: int = 0
     uptime: str = ""
+    uptime_seconds: int = 0
     total_users: int = 0
     speed_mbps: float = 0.0
     ping_ms: int = 0
     total_traffic: str = ""
+    total_traffic_bytes: int = 0
     log_policy: str = ""
     operator: str = ""
     score: int = 0
@@ -172,8 +174,10 @@ class VpnServer:
             "isp_hostname": self.isp_hostname,
             "sessions": self.sessions,
             "uptime": self.uptime,
+            "uptime_seconds": self.uptime_seconds,
             "total_users": self.total_users,
             "total_traffic": self.total_traffic,
+            "total_traffic_bytes": self.total_traffic_bytes,
             "log_policy": self.log_policy,
             "operator": self.operator,
             "speed_mbps": self.speed_mbps,

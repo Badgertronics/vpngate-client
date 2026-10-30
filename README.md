@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="app/icons/hicolor/scalable/apps/VPN%20Gate%20Client%20(Badgertronics).png" alt="VPN Gate Client Logo" width="160" height="160">
+  <img src="app/icons/hicolor/scalable/apps/com.vpngate.client.png" alt="VPN Gate Client Logo" width="160" height="160">
 </p>
 
 # 🛡️ VPN Gate Client 🚀

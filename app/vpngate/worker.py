@@ -34,6 +34,10 @@ class Worker:
         self.connection: Optional[dict] = None
         self.backend = None
         self.protocol: Optional[Protocol] = None
+        self._connecting_backend = None
+        self._connect_thread: Optional[threading.Thread] = None
+        self._connect_lock = threading.Lock()
+        self._is_connecting = False
         if sys.platform != "win32" and hasattr(os, "geteuid") and os.geteuid() == 0:
             self.workdir = "/run/vpngate-client"
         else:
@@ -95,68 +99,137 @@ class Worker:
     def handle(self, command: dict) -> None:
         action = command.get("cmd")
         if action == "connect":
-            self.do_connect(command)
-        elif action == "disconnect":
-            self.do_disconnect()
+            self.start_connect(command)
+        elif action in ("disconnect", "abort"):
+            self.do_abort_or_disconnect()
         elif action == "status":
             self.do_status()
         elif action == "quit":
-            self.do_disconnect()
+            self.do_abort_or_disconnect()
             _emit({"event": "bye"})
             sys.exit(0)
         else:
             _emit({"event": "error", "message": f"Unknown command: {action}"})
 
-    def do_connect(self, command: dict) -> None:
-        if self.connection is not None:
-            self.do_disconnect()
-        try:
-            protocol = Protocol(command.get("protocol", "openvpn"))
-        except ValueError:
-            _emit({"event": "error", "message": "Unsupported protocol."})
-            return
-        backend = BACKENDS.get(protocol)
-        if backend is None:
-            _emit({"event": "error", "message": "No backend for this protocol."})
-            return
-        if not backend.available():
-            if sys.platform == "win32":
-                if protocol == Protocol.OPENVPN:
-                    msg = ("The OpenVPN client is not installed on this PC. "
-                           "Please select MS-SSTP or L2TP/IPsec (built into Windows), "
-                           "or install OpenVPN from https://openvpn.net")
-                elif protocol == Protocol.SSLVP:
-                    msg = ("The SSL-VPN (SoftEther) client is not installed on this PC. "
-                           "Please select MS-SSTP or L2TP/IPsec (built into Windows), "
-                           "or install SoftEther from https://www.vpngate.net")
+    def do_abort_or_disconnect(self) -> None:
+        with self._connect_lock:
+            if self._is_connecting:
+                self._log("Cancelling in-progress connection attempt ...")
+                if self._connecting_backend is not None:
+                    try:
+                        self._connecting_backend.abort(self._log)
+                    except Exception as exc:
+                        self._log(f"Error aborting backend: {exc}")
+                self._is_connecting = False
+                self._connecting_backend = None
+                _emit({"event": "state", "state": "disconnected", "message": "Connection cancelled."})
+                return
+
+        self.do_disconnect()
+
+    def start_connect(self, command: dict) -> None:
+        with self._connect_lock:
+            if self._is_connecting:
+                if self._connecting_backend is not None:
+                    try:
+                        self._connecting_backend.abort(self._log)
+                    except Exception:
+                        pass
+                self._is_connecting = False
+
+            if self.connection is not None:
+                self.do_disconnect()
+
+            try:
+                protocol = Protocol(command.get("protocol", "openvpn"))
+            except ValueError:
+                _emit({"event": "error", "message": "Unsupported protocol."})
+                _emit({"event": "state", "state": "disconnected"})
+                return
+
+            backend = BACKENDS.get(protocol)
+            if backend is None:
+                _emit({"event": "error", "message": "No backend for this protocol."})
+                _emit({"event": "state", "state": "disconnected"})
+                return
+
+            if not backend.available():
+                if sys.platform == "win32":
+                    if protocol == Protocol.OPENVPN:
+                        msg = ("The OpenVPN client is not installed on this PC. "
+                               "Please select MS-SSTP or L2TP/IPsec (built into Windows), "
+                               "or install OpenVPN from https://openvpn.net")
+                    elif protocol == Protocol.SSLVP:
+                        msg = ("The SSL-VPN (SoftEther) client is not installed on this PC. "
+                               "Please select MS-SSTP or L2TP/IPsec (built into Windows), "
+                               "or install SoftEther from https://www.vpngate.net")
+                    else:
+                        msg = f"The {backend.name} client is not installed."
                 else:
                     msg = f"The {backend.name} client is not installed."
-            else:
-                msg = f"The {backend.name} client is not installed."
-            _emit({"event": "error", "message": msg})
-            return
+                _emit({"event": "error", "message": msg})
+                _emit({"event": "state", "state": "disconnected"})
+                return
 
-        server = self._server_from(command.get("server", {}))
-        _emit({"event": "state", "state": "connecting",
-               "protocol": protocol.value,
-               "message": f"Connecting to {server.hostname} ({server.ip}) "
-                          f"using {backend.name} ..."})
+            server = self._server_from(command.get("server", {}))
+            timeout = int(command.get("timeout") or 30)
+            retries = int(command.get("retries") or 1)
+
+            self._is_connecting = True
+            self._connecting_backend = backend
+
+            _emit({"event": "state", "state": "connecting",
+                   "protocol": protocol.value,
+                   "message": f"Connecting to {server.hostname} ({server.ip}) "
+                              f"using {backend.name} ..."})
+
+            thread = threading.Thread(
+                target=self._connect_thread_worker,
+                args=(backend, server, protocol, timeout, retries),
+                daemon=True,
+            )
+            self._connect_thread = thread
+            thread.start()
+
+    def _connect_thread_worker(self, backend, server: VpnServer, protocol: Protocol,
+                               timeout: int, retries: int) -> None:
         try:
-            info = backend.connect(server, protocol, self._log, self.workdir)
+            info = backend.connect(server, protocol, self._log, self.workdir,
+                                   timeout=timeout, retries=retries)
         except BackendError as exc:
+            with self._connect_lock:
+                if not self._is_connecting or self._connecting_backend is not backend:
+                    return
+                self._is_connecting = False
+                self._connecting_backend = None
             _emit({"event": "error", "message": str(exc)})
             _emit({"event": "state", "state": "disconnected"})
             return
         except Exception as exc:                  # noqa: BLE001
+            with self._connect_lock:
+                if not self._is_connecting or self._connecting_backend is not backend:
+                    return
+                self._is_connecting = False
+                self._connecting_backend = None
             self._log(traceback.format_exc())
             _emit({"event": "error", "message": f"{type(exc).__name__}: {exc}"})
             _emit({"event": "state", "state": "disconnected"})
             return
 
-        info["started_at"] = time.time()
-        self.connection = info
-        self.backend = backend
-        self.protocol = protocol
+        with self._connect_lock:
+            if not self._is_connecting or self._connecting_backend is not backend:
+                try:
+                    backend.disconnect(info, self._log)
+                except Exception:
+                    pass
+                return
+            self._is_connecting = False
+            self._connecting_backend = None
+
+            info["started_at"] = time.time()
+            self.connection = info
+            self.backend = backend
+            self.protocol = protocol
 
         external = ""
         try:
@@ -170,14 +243,15 @@ class Worker:
 
     def do_disconnect(self) -> None:
         self._win_vpn_missed = 0
-        if self.connection is None or self.backend is None:
+        with self._connect_lock:
+            conn = self.connection
+            backend = self.backend
+            self.connection = None
+            self.backend = None
+            self.protocol = None
+        if conn is None or backend is None:
             _emit({"event": "state", "state": "disconnected"})
             return
-        conn = self.connection
-        backend = self.backend
-        self.connection = None
-        self.backend = None
-        self.protocol = None
         try:
             backend.disconnect(conn, self._log)
         except Exception as exc:                  # noqa: BLE001
@@ -185,10 +259,15 @@ class Worker:
         _emit({"event": "state", "state": "disconnected"})
 
     def do_status(self) -> None:
-        if self.connection is None:
+        with self._connect_lock:
+            conn = self.connection
+            is_connecting = self._is_connecting
+        if is_connecting:
+            _emit({"event": "state", "state": "connecting"})
+        elif conn is None:
             _emit({"event": "state", "state": "disconnected"})
         else:
-            _emit({"event": "connected", "info": _jsonable(self.connection)})
+            _emit({"event": "connected", "info": _jsonable(conn)})
             _emit({"event": "state", "state": "connected"})
 
 
