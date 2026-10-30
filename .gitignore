@@ -16,6 +16,7 @@ build/
 build_tmp/
 dist/
 dist_release/
+dist_test/
 *.spec
 *.deb
 *.tar.gz

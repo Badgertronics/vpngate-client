@@ -2289,11 +2289,11 @@ class VpnGateWindow(Adw.ApplicationWindow):
         return page
 
     def _timeouts_page(self, dialog: Optional[Adw.PreferencesDialog] = None) -> Adw.PreferencesPage:
-        page = Adw.PreferencesPage(title=_("Timeouts & Retries"),
+        page = Adw.PreferencesPage(title=_("Timeouts and Retries"),
                                    icon_name="preferences-system-time-symbolic")
 
         group = Adw.PreferencesGroup(
-            title=_("Connection Timeouts & Attempts"),
+            title=_("Connection Timeouts and Attempts"),
             description=_("Adjust waiting periods and retry behavior for tunnel dials and probes."))
 
         current_timeout = float(self.settings.get("connect_timeout", DEFAULT_CONNECT_TIMEOUT))
