@@ -21,7 +21,8 @@ from __future__ import annotations
 import os
 import sys
 import time
-from typing import List
+from gettext import gettext as _
+from typing import List, Optional, Tuple
 
 import gi
 
