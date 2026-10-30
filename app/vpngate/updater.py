@@ -96,16 +96,15 @@ def check_for_updates() -> Optional[dict]:
 
 
 def download_update_asset(asset_url: str, filename: str,
+                          expected_size: int = 0,
                           log_cb: Optional[Callable[[str], None]] = None) -> Optional[str]:
-    """Download update package into a temporary file."""
+    """Download update package into a temporary file with live progress logging."""
     dest_path = os.path.join(tempfile.gettempdir(), filename)
     if log_cb:
         log_cb(f"[update] Downloading {filename} ...")
-    ok = download_file_resilient(asset_url, dest_path, timeout=180, log_cb=log_cb)
+    ok = download_file_resilient(asset_url, dest_path, timeout=180, expected_size=expected_size,
+                                 log_cb=log_cb, prefix="[update]")
     if ok and os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0:
-        if log_cb:
-            mb = os.path.getsize(dest_path) / (1024 * 1024)
-            log_cb(f"[update] ✓ Downloaded {filename} ({mb:.1f} MB)")
         return dest_path
     if log_cb:
         log_cb(f"[update] ✗ Failed to download {filename}")

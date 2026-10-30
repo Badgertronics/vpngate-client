@@ -447,13 +447,64 @@ def measure_server_latency(server, timeout: float = 0.8) -> int:
     return -1
 
 
-def download_file_resilient(url: str, dest_path: str, timeout: int = 120,
-                            log_cb: Optional[Callable[[str], None]] = None) -> bool:
-    """Download a file with high resilience against missing root CAs and proxies.
+def format_size(bytes_num: float) -> str:
+    """Format bytes into human-readable B, KB, MB, or GB."""
+    if bytes_num >= 1024 * 1024 * 1024:
+        return f"{bytes_num / (1024 * 1024 * 1024):.2f} GB"
+    elif bytes_num >= 1024 * 1024:
+        return f"{bytes_num / (1024 * 1024):.1f} MB"
+    elif bytes_num >= 1024:
+        return f"{bytes_num / 1024:.1f} KB"
+    else:
+        return f"{int(bytes_num)} B"
 
-    Tries native curl.exe with -k -L first, then falls back to urllib with an
-    unverified SSL context, and finally PowerShell on Windows.
-    Returns True if dest_path was created with size > 0, False otherwise.
+
+def format_time(seconds: float) -> str:
+    """Format seconds into MM:SS or HH:MM:SS."""
+    if seconds < 0 or seconds > 86400 * 7:
+        return "--:--"
+    sec = int(round(seconds))
+    mins, s = divmod(sec, 60)
+    hrs, m = divmod(mins, 60)
+    if hrs > 0:
+        return f"{hrs:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _format_download_progress(prefix: str, downloaded: int, total: int, speed: float,
+                              elapsed: float, eta: float) -> str:
+    spd_str = f"{format_size(speed)}/s" if speed > 0 else "0 B/s"
+    elap_str = format_time(elapsed)
+    if total > 0:
+        pct = min(100.0, (downloaded / total) * 100.0)
+        rem_bytes = max(0, total - downloaded)
+        eta_str = format_time(eta) if eta >= 0 else "--:--"
+        return (
+            f"{prefix} Progress: {pct:.1f}% | "
+            f"Downloaded: {format_size(downloaded)} / {format_size(total)} | "
+            f"Remaining size: {format_size(rem_bytes)} | "
+            f"Speed: {spd_str} | "
+            f"Elapsed: {elap_str} | "
+            f"Remaining time: {eta_str}"
+        )
+    else:
+        return (
+            f"{prefix} Downloaded: {format_size(downloaded)} | "
+            f"Speed: {spd_str} | "
+            f"Elapsed: {elap_str}"
+        )
+
+
+def download_file_resilient(url: str, dest_path: str, timeout: int = 180,
+                            expected_size: int = 0,
+                            log_cb: Optional[Callable[[str], None]] = None,
+                            prefix: str = "[download]") -> bool:
+    """Download a file with live progress reporting and multi-stage fallback.
+
+    Tracks and logs: progress %, downloaded size, remaining size, download speed,
+    elapsed time, and remaining time (ETA).
+    Tries Python urllib streaming with unverified SSL first, then native curl with
+    size-monitoring, and finally PowerShell on Windows.
     """
     def _log(msg: str) -> None:
         if log_cb:
@@ -466,7 +517,65 @@ def download_file_resilient(url: str, dest_path: str, timeout: int = 120,
     except Exception:
         pass
 
-    # 1. Try native curl binary (handles system certificates, redirects, -k)
+    # 1. Primary: Python urllib streaming in chunks with resilient SSL context
+    try:
+        import urllib.request
+        import ssl
+        ctx = ssl._create_unverified_context()
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VPN-Gate-Client"}
+        )
+        with urllib.request.urlopen(req, context=ctx, timeout=min(timeout, 30)) as resp:
+            total_size = expected_size
+            try:
+                cl = resp.headers.get("Content-Length")
+                if cl:
+                    cl_val = int(cl.strip())
+                    if cl_val > 0:
+                        total_size = cl_val
+            except Exception:
+                pass
+
+            t0 = time.perf_counter()
+            last_report = t0
+            last_bytes = 0
+            downloaded = 0
+            smoothed_speed = 0.0
+            chunk_size = 65536
+
+            with open(dest_path, "wb") as f:
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+
+                    now = time.perf_counter()
+                    if now - last_report >= 0.8:
+                        delta_t = now - last_report
+                        delta_b = downloaded - last_bytes
+                        inst_speed = delta_b / delta_t if delta_t > 0 else 0.0
+                        smoothed_speed = inst_speed if smoothed_speed == 0.0 else (0.4 * inst_speed + 0.6 * smoothed_speed)
+                        elapsed = now - t0
+                        rem_bytes = max(0, total_size - downloaded) if total_size > 0 else 0
+                        eta = rem_bytes / smoothed_speed if (smoothed_speed > 1024 and total_size > 0) else -1
+                        _log(_format_download_progress(prefix, downloaded, total_size, smoothed_speed, elapsed, eta))
+                        last_report = now
+                        last_bytes = downloaded
+
+            if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                final_size = os.path.getsize(dest_path)
+                total_elapsed = max(0.001, time.perf_counter() - t0)
+                avg_speed = final_size / total_elapsed
+                _log(_format_download_progress(prefix, final_size, total_size or final_size, avg_speed, total_elapsed, 0.0))
+                _log(f"{prefix} ✓ Download completed: {format_size(final_size)} in {format_time(total_elapsed)} (avg {format_size(avg_speed)}/s)")
+                return True
+    except Exception as exc:
+        _log(f"{prefix} urllib attempt encountered: {exc}, trying curl ...")
+
+    # 2. Fallback: native curl binary with live file-size progress monitoring
     curl_candidates = [
         "curl.exe" if sys.platform == "win32" else "curl",
         "C:\\Windows\\System32\\curl.exe",
@@ -482,33 +591,39 @@ def download_file_resilient(url: str, dest_path: str, timeout: int = 120,
                 "--connect-timeout", "15", "-m", str(timeout),
                 "-o", dest_path, url
             ]
-            res = subprocess.run(cmd, capture_output=True, text=True,
-                                 timeout=timeout + 5, creationflags=creation_flags)
-            if res.returncode == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+            t0 = time.perf_counter()
+            last_report = t0
+            last_bytes = 0
+            smoothed_speed = 0.0
+            total_size = expected_size
+
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    creationflags=creation_flags)
+            while proc.poll() is None:
+                time.sleep(0.8)
+                if os.path.exists(dest_path):
+                    downloaded = os.path.getsize(dest_path)
+                    now = time.perf_counter()
+                    delta_t = now - last_report
+                    delta_b = downloaded - last_bytes
+                    inst_speed = delta_b / delta_t if delta_t > 0 else 0.0
+                    smoothed_speed = inst_speed if smoothed_speed == 0.0 else (0.4 * inst_speed + 0.6 * smoothed_speed)
+                    elapsed = now - t0
+                    rem_bytes = max(0, total_size - downloaded) if total_size > 0 else 0
+                    eta = rem_bytes / smoothed_speed if (smoothed_speed > 1024 and total_size > 0) else -1
+                    _log(_format_download_progress(prefix, downloaded, total_size, smoothed_speed, elapsed, eta))
+                    last_report = now
+                    last_bytes = downloaded
+
+            if proc.returncode == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                final_size = os.path.getsize(dest_path)
+                total_elapsed = max(0.001, time.perf_counter() - t0)
+                avg_speed = final_size / total_elapsed
+                _log(_format_download_progress(prefix, final_size, total_size or final_size, avg_speed, total_elapsed, 0.0))
+                _log(f"{prefix} ✓ Download completed: {format_size(final_size)} in {format_time(total_elapsed)} (avg {format_size(avg_speed)}/s)")
                 return True
         except Exception as exc:
-            _log(f"[download] curl attempt failed: {exc}")
-
-    # 2. Fallback: Python urllib with resilient SSL context
-    try:
-        import urllib.request
-        import ssl
-        ctx = ssl._create_unverified_context()
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VPN-Gate-Client"}
-        )
-        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
-            with open(dest_path, "wb") as f:
-                while True:
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
-            return True
-    except Exception as exc:
-        _log(f"[download] urllib attempt failed: {exc}")
+            _log(f"{prefix} curl attempt failed: {exc}")
 
     # 3. Windows PowerShell WebClient fallback
     if sys.platform == "win32":
@@ -519,13 +634,40 @@ def download_file_resilient(url: str, dest_path: str, timeout: int = 120,
                 f"(New-Object Net.WebClient).DownloadFile('{url}', '{dest_path}')"
             )
             creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            res = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
-                                 capture_output=True, text=True, timeout=timeout + 10,
-                                 creationflags=creation_flags)
-            if res.returncode == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+            t0 = time.perf_counter()
+            last_report = t0
+            last_bytes = 0
+            smoothed_speed = 0.0
+            total_size = expected_size
+
+            proc = subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    creationflags=creation_flags)
+            while proc.poll() is None:
+                time.sleep(0.8)
+                if os.path.exists(dest_path):
+                    downloaded = os.path.getsize(dest_path)
+                    now = time.perf_counter()
+                    delta_t = now - last_report
+                    delta_b = downloaded - last_bytes
+                    inst_speed = delta_b / delta_t if delta_t > 0 else 0.0
+                    smoothed_speed = inst_speed if smoothed_speed == 0.0 else (0.4 * inst_speed + 0.6 * smoothed_speed)
+                    elapsed = now - t0
+                    rem_bytes = max(0, total_size - downloaded) if total_size > 0 else 0
+                    eta = rem_bytes / smoothed_speed if (smoothed_speed > 1024 and total_size > 0) else -1
+                    _log(_format_download_progress(prefix, downloaded, total_size, smoothed_speed, elapsed, eta))
+                    last_report = now
+                    last_bytes = downloaded
+
+            if proc.returncode == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                final_size = os.path.getsize(dest_path)
+                total_elapsed = max(0.001, time.perf_counter() - t0)
+                avg_speed = final_size / total_elapsed
+                _log(_format_download_progress(prefix, final_size, total_size or final_size, avg_speed, total_elapsed, 0.0))
+                _log(f"{prefix} ✓ Download completed: {format_size(final_size)} in {format_time(total_elapsed)} (avg {format_size(avg_speed)}/s)")
                 return True
         except Exception as exc:
-            _log(f"[download] powershell attempt failed: {exc}")
+            _log(f"{prefix} powershell attempt failed: {exc}")
 
     return False
 

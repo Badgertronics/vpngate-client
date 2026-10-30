@@ -911,7 +911,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_ping_all_clicked(self, *_) -> None:
+    def _on_ping_all_clicked(self, *args) -> None:
         if getattr(self, "_pinging_all", False):
             self._ping_cancel = True
             self.ping_all_btn.set_label(_("Stopping..."))
@@ -2715,6 +2715,9 @@ class VpnGateWindow(Adw.ApplicationWindow):
         if not asset or not asset.get("url"):
             return
 
+        if hasattr(self, "sheet_btn") and not self.sheet_btn.get_active():
+            self.sheet_btn.set_active(True)
+
         tag = info.get("tag_name", "")
         filename = asset.get("name") or ("vpngate-update.zip" if sys.platform == "win32" else "vpngate-update.deb")
         self.toast(_("Downloading update {ver} ...").format(ver=tag))
@@ -2723,6 +2726,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         def worker():
             dest = updater.download_update_asset(
                 asset["url"], filename,
+                expected_size=int(asset.get("size") or 0),
                 log_cb=lambda msg: GLib.idle_add(self._append_log, msg)
             )
             if not dest or not os.path.isfile(dest):
