@@ -38,7 +38,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gdk, Gio, Gtk, Pango  # noqa: E402
 
-from . import fetcher, privilege                      # noqa: E402
+from . import fetcher, privilege, updater              # noqa: E402
 from .backends import BACKENDS, install_backend_windows  # noqa: E402
 from .netutil import measure_server_latency           # noqa: E402
 from .config import (APP_NAME, DEFAULT_CONNECT_RETRIES, DEFAULT_CONNECT_TIMEOUT,  # noqa: E402
@@ -51,6 +51,7 @@ from .tray import Tray                                # noqa: E402
 from .widgets import (SpeedBar, StatusRing, Segmented, apply_theme_css,
                       flag_emoji, flag_text, flag_widget, ping_chip,
                       ping_level, protocol_chip, protocol_name,
+                      real_ping_chip, reported_ping_chip,
                       skeleton_rows, stat_chip)  # noqa: E402
 
 APP_ID = "com.vpngate.client"
@@ -597,6 +598,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._open_sheet()
         self._watch_network()
         GLib.timeout_add_seconds(1, self._tick)
+        GLib.timeout_add_seconds(4, self._check_update_startup)
         GLib.idle_add(self._load_cached)
 
     # ==================================================================
@@ -861,37 +863,37 @@ class VpnGateWindow(Adw.ApplicationWindow):
         for idx, s in self._row_for.items():
             if s is server or s.ip == server.ip:
                 row = self._rows.get(idx)
-                if row and hasattr(row, "_ping_chip"):
-                    chip = row._ping_chip
+                if row and hasattr(row, "_real_ping_chip"):
+                    chip = row._real_ping_chip
                     ms = getattr(server, "real_ping_ms", None)
-                    if ms is not None:
-                        if ms < 0:
-                            chip.set_text(_("Offline"))
-                            chip.set_tooltip_text(_("Tested latency: Unreachable (timed out)"))
-                            for c in ("chip-ping-ok", "chip-ping-mid", "chip-ping-slow"):
-                                chip.remove_css_class(c)
-                            chip.add_css_class("chip-ping-slow")
-                        else:
-                            chip.set_text(f"{ms} ms")
-                            tip = _("Tested latency: {real} ms (Reported: {rep} ms)").format(
-                                real=ms, rep=server.ping_ms) if server.ping_ms > 0 else f"Tested: {ms} ms"
-                            chip.set_tooltip_text(tip)
-                            for c in ("chip-ping-ok", "chip-ping-mid", "chip-ping-slow"):
-                                chip.remove_css_class(c)
-                            chip.add_css_class("chip-ping-ok" if ms <= 120 else ("chip-ping-mid" if ms <= 320 else "chip-ping-slow"))
+                    for c in ("chip-ping-ok", "chip-ping-mid", "chip-ping-slow", "chip-slate"):
+                        chip.remove_css_class(c)
+                    if ms is None:
+                        chip.set_text("⚡ —")
+                        chip.set_tooltip_text(_("Direct delay from this PC: Not tested yet (click Ping to test)"))
+                        chip.add_css_class("chip-slate")
+                    elif ms < 0:
+                        chip.set_text(_("⚡ Offline"))
+                        chip.set_tooltip_text(_("Direct delay from this PC: Unreachable (timed out)"))
+                        chip.add_css_class("chip-ping-slow")
+                    else:
+                        chip.set_text(f"⚡ {ms} ms")
+                        chip.set_tooltip_text(_("Direct delay from this PC: {ms} ms").format(ms=ms))
+                        level = ping_level(ms)
+                        chip.add_css_class("chip-ping-ok" if level == "ok" else ("chip-ping-mid" if level == "mid" else "chip-ping-slow"))
                 break
 
     def _ping_single_server(self, server: VpnServer) -> None:
         host = server.hostname or server.ip
-        self._append_log(_("[ping] Testing latency to {host} ({ip}) ...").format(host=host, ip=server.ip))
+        self._append_log(_("[ping] Testing direct latency to {host} ({ip}) ...").format(host=host, ip=server.ip))
 
         def worker():
-            ms = measure_server_latency(server, timeout=2.0)
+            ms = measure_server_latency(server, timeout=1.0)
             server.real_ping_ms = ms
 
             def deliver():
                 if ms >= 0:
-                    self._append_log(_("[ping] ✓ {host} ({ip}): {ms} ms latency").format(
+                    self._append_log(_("[ping] ✓ {host} ({ip}): {ms} ms direct delay").format(
                         host=host, ip=server.ip, ms=ms))
                     self.toast(_("{host}: {ms} ms").format(host=host, ms=ms))
                 else:
@@ -927,7 +929,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self.ping_all_btn.set_label(_("Stop Ping"))
         self.ping_all_btn.set_icon_name("process-stop-symbolic")
         self.ping_all_btn.add_css_class("destructive-action")
-        self._append_log(_("[ping] Testing real latency for {count} servers (concurrent) ...").format(count=len(servers_to_ping)))
+        self._append_log(_("[ping] Testing direct delay for {count} servers (in parallel) ...").format(count=len(servers_to_ping)))
 
         def worker():
             from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -936,9 +938,9 @@ class VpnGateWindow(Adw.ApplicationWindow):
             completed = 0
             total = len(servers_to_ping)
 
-            with ThreadPoolExecutor(max_workers=14) as executor:
+            with ThreadPoolExecutor(max_workers=25) as executor:
                 future_to_server = {
-                    executor.submit(measure_server_latency, s, 1.5): s
+                    executor.submit(measure_server_latency, s, 0.8): s
                     for s in servers_to_ping
                 }
                 for future in as_completed(future_to_server):
@@ -951,12 +953,18 @@ class VpnGateWindow(Adw.ApplicationWindow):
                         ms = -1
                     s.real_ping_ms = ms
                     completed += 1
+                    host_str = s.hostname or s.ip
                     if ms >= 0:
                         reachable_count += 1
+                        log_line = _("[ping] [{done}/{total}] ✓ {host} ({ip}): {ms} ms direct delay").format(
+                            done=completed, total=total, host=host_str, ip=s.ip, ms=ms)
                     else:
                         unreachable_count += 1
+                        log_line = _("[ping] [{done}/{total}] ✗ {host} ({ip}): unreachable / timed out").format(
+                            done=completed, total=total, host=host_str, ip=s.ip)
 
-                    def update_one(srv=s, c=completed):
+                    def update_one(srv=s, c=completed, line=log_line):
+                        self._append_log(line)
                         if getattr(self, "_pinging_all", False) and not getattr(self, "_ping_cancel", False):
                             self.ping_all_btn.set_label(_("Stop ({done}/{total})").format(done=c, total=total))
                         self._update_server_row_ping(srv)
@@ -966,17 +974,25 @@ class VpnGateWindow(Adw.ApplicationWindow):
                     GLib.idle_add(update_one)
 
             def done():
+                stopped = getattr(self, "_ping_cancel", False)
                 self._pinging_all = False
                 self._ping_cancel = False
                 self.ping_all_btn.set_label(_("Ping All"))
                 self.ping_all_btn.set_icon_name("network-transmit-receive-symbolic")
                 self.ping_all_btn.remove_css_class("destructive-action")
                 self.ping_all_btn.set_sensitive(True)
-                msg = _("[ping] Completed: {ok} reachable, {bad} unreachable").format(
-                    ok=reachable_count, bad=unreachable_count)
-                self._append_log(msg)
-                self.toast(_("Ping completed: {ok} reachable, {bad} unreachable").format(
-                    ok=reachable_count, bad=unreachable_count))
+                if stopped:
+                    msg = _("[ping] Latency testing stopped by user ({done}/{total} tested: {ok} reachable, {bad} unreachable)").format(
+                        done=completed, total=total, ok=reachable_count, bad=unreachable_count)
+                    self._append_log(msg)
+                    self.toast(_("Ping stopped ({ok} reachable, {bad} unreachable)").format(
+                        ok=reachable_count, bad=unreachable_count))
+                else:
+                    msg = _("[ping] Completed: {ok} reachable, {bad} unreachable").format(
+                        ok=reachable_count, bad=unreachable_count)
+                    self._append_log(msg)
+                    self.toast(_("Ping completed: {ok} reachable, {bad} unreachable").format(
+                        ok=reachable_count, bad=unreachable_count))
                 if self._sort == "real_ping":
                     self._apply_filters()
                 return False
@@ -1077,7 +1093,9 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self.details_grid = Gtk.Grid(column_spacing=12, row_spacing=8)
         self.detail_values: Dict[str, Gtk.Label] = {}
         for index, (key, caption) in enumerate((
-            ("speed", _("Line speed")), ("ping", _("Ping")),
+            ("speed", _("Line speed")),
+            ("real_ping", _("Your delay (direct)")),
+            ("reported_ping", _("Reported delay (to Google)")),
             ("sessions", _("Sessions")), ("uptime", _("Uptime")),
             ("users", _("Total users")), ("traffic", _("Traffic")),
             ("operator", _("Operator")), ("isp", _("ISP host")),
@@ -1511,13 +1529,17 @@ class VpnGateWindow(Adw.ApplicationWindow):
         right.append(speed_box)
 
         ping_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6, halign=Gtk.Align.END)
-        p_chip = ping_chip(server.ping_ms, getattr(server, "real_ping_ms", None))
-        row._ping_chip = p_chip
-        ping_box.append(p_chip)
+        real_c = real_ping_chip(getattr(server, "real_ping_ms", None))
+        row._real_ping_chip = real_c
+        ping_box.append(real_c)
+
+        rep_c = reported_ping_chip(server.ping_ms)
+        row._rep_ping_chip = rep_c
+        ping_box.append(rep_c)
 
         ping_btn = Gtk.Button(icon_name="network-transmit-receive-symbolic",
                               css_classes=["flat", "circular"],
-                              tooltip_text=_("Ping this server to test latency"))
+                              tooltip_text=_("Ping this server to test your direct delay"))
         ping_btn.connect("clicked", lambda _b, s=server: self._ping_single_server(s))
         ping_box.append(ping_btn)
 
@@ -1547,16 +1569,20 @@ class VpnGateWindow(Adw.ApplicationWindow):
         host = server.hostname or server.ip
         self.details_host.set_text("{}\nIP {}\nISP {}".format(
             host, server.ip or "—", server.isp_hostname or "—"))
-        ping_val = server.ping_text
-        if getattr(server, "real_ping_ms", None) is not None:
-            if server.real_ping_ms < 0:
-                ping_val = _("Offline (unreachable) · reported {rep}").format(rep=server.ping_text)
-            else:
-                ping_val = _("{real} ms (real delay) · reported {rep}").format(
-                    real=server.real_ping_ms, rep=server.ping_text)
+        real_ms = getattr(server, "real_ping_ms", None)
+        if real_ms is None:
+            real_ping_str = _("Not tested yet (click Ping)")
+        elif real_ms < 0:
+            real_ping_str = _("Offline (unreachable)")
+        else:
+            real_ping_str = f"{real_ms} ms"
+
+        rep_ping_str = f"{server.ping_ms} ms" if server.ping_ms > 0 else "—"
+
         values = {
             "speed": server.speed_text,
-            "ping": ping_val,
+            "real_ping": real_ping_str,
+            "reported_ping": rep_ping_str,
             "sessions": server.sessions_text,
             "uptime": server.uptime or "—",
             "users": f"{server.total_users:,}" if server.total_users else "—",
@@ -2193,6 +2219,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         dialog.add(self._connectivity_page(dialog))
         if sys.platform == "win32":
             dialog.add(self._vpn_clients_page(dialog))
+        dialog.add(self._updates_page(dialog))
         dialog.add(self._mirrors_page(dialog))
         dialog.add(self._support_page(dialog))
         dialog.props.search_enabled = False
@@ -2627,6 +2654,219 @@ class VpnGateWindow(Adw.ApplicationWindow):
             group.add(row)
         page.add(group)
         return page
+
+    # ==================================================================
+    # Auto-updater
+    # ==================================================================
+
+    def _check_update_startup(self) -> bool:
+        if not self.settings.get("check_updates_startup", True):
+            return False
+
+        def task():
+            try:
+                info = updater.check_for_updates()
+                if info:
+                    GLib.idle_add(lambda: self._prompt_update(info, manual=False))
+            except Exception:
+                pass
+
+        threading.Thread(target=task, daemon=True).start()
+        return False
+
+    def _prompt_update(self, info: dict, manual: bool = False) -> None:
+        tag = info.get("tag_name", "")
+        body = info.get("body", "").strip()
+        asset = info.get("asset")
+
+        dialog = Adw.AlertDialog()
+        dialog.set_heading(_("Update Available: {ver}").format(ver=tag))
+
+        msg = _("A new version of VPN Gate Client is available.")
+        if body:
+            lines = [line.strip() for line in body.splitlines() if line.strip()][:6]
+            msg += "\n\n" + "\n".join(lines)
+
+        if not asset:
+            msg += "\n\n" + _("Please download the package from GitHub.")
+            dialog.set_body(msg)
+            dialog.add_response("close", _("Close"))
+            dialog.add_response("github", _("View on GitHub"))
+            dialog.set_response_appearance("github", Adw.ResponseAppearance.SUGGESTED)
+        else:
+            msg += "\n\n" + _("Would you like to download and install this update now?")
+            dialog.set_body(msg)
+            dialog.add_response("cancel", _("Later"))
+            dialog.add_response("github", _("View on GitHub"))
+            dialog.add_response("update", _("Update Now"))
+            dialog.set_response_appearance("update", Adw.ResponseAppearance.SUGGESTED)
+
+        def on_response(_dialog, response_id: str):
+            if response_id == "github":
+                Gtk.show_uri(self, info.get("html_url", GITHUB_URL), Gdk.CURRENT_TIME)
+            elif response_id == "update" and asset:
+                self._start_self_update(info)
+
+        dialog.connect("response", on_response)
+        dialog.present(self)
+
+    def _start_self_update(self, info: dict) -> None:
+        asset = info.get("asset")
+        if not asset or not asset.get("url"):
+            return
+
+        tag = info.get("tag_name", "")
+        filename = asset.get("name") or ("vpngate-update.zip" if sys.platform == "win32" else "vpngate-update.deb")
+        self.toast(_("Downloading update {ver} ...").format(ver=tag))
+        self._append_log(_("[update] Starting download of update {ver} ({name}) ...").format(ver=tag, name=filename))
+
+        def worker():
+            dest = updater.download_update_asset(
+                asset["url"], filename,
+                log_cb=lambda msg: GLib.idle_add(self._append_log, msg)
+            )
+            if not dest or not os.path.isfile(dest):
+                def on_fail():
+                    self.toast(_("Update download failed"))
+                    self._append_log(_("[update] ✗ Update download failed"))
+                    return False
+                GLib.idle_add(on_fail)
+                return
+
+            if sys.platform == "win32":
+                if getattr(sys, "frozen", False):
+                    app_dir = os.path.dirname(os.path.abspath(sys.executable))
+                    GLib.idle_add(self._append_log, _("[update] Extracting update and launching updater script ..."))
+                    ok = updater.apply_windows_update(dest, app_dir, os.getpid())
+                    if ok:
+                        GLib.idle_add(lambda: self.toast(_("Restarting for update...")))
+                        time.sleep(0.5)
+                        GLib.idle_add(self._quit)
+                    else:
+                        GLib.idle_add(self._append_log, _("[update] ✗ Failed to launch updater script"))
+                        GLib.idle_add(lambda: self.toast(_("Failed to apply update")))
+                else:
+                    def on_dev():
+                        self._append_log(_("[update] Running from source (git). Please update via 'git pull'."))
+                        self.toast(_("Running from source. Please run 'git pull'."))
+                        Gtk.show_uri(self, info.get("html_url", GITHUB_URL), Gdk.CURRENT_TIME)
+                        return False
+                    GLib.idle_add(on_dev)
+            else:
+                if dest.endswith(".deb"):
+                    GLib.idle_add(self._append_log, _("[update] Running package installer via pkexec dpkg -i ..."))
+                    ok, msg = updater.apply_linux_update(dest)
+                    if ok:
+                        def on_success():
+                            self._append_log(_("[update] ✓ Update {ver} installed successfully!").format(ver=tag))
+                            self.toast(_("Update installed successfully!"))
+                            d = Adw.AlertDialog()
+                            d.set_heading(_("Update Installed"))
+                            d.set_body(_("VPN Gate Client has been updated to {ver}. Please restart the application to apply changes.").format(ver=tag))
+                            d.add_response("later", _("Later"))
+                            d.add_response("restart", _("Restart Now"))
+                            d.set_response_appearance("restart", Adw.ResponseAppearance.SUGGESTED)
+                            def on_r(_d, resp):
+                                if resp == "restart":
+                                    self._quit()
+                            d.connect("response", on_r)
+                            d.present(self)
+                            return False
+                        GLib.idle_add(on_success)
+                    else:
+                        def on_fail_install(err=msg):
+                            self._append_log(_("[update] ✗ Installation error: {err}").format(err=err))
+                            self.toast(_("Update installation failed: {err}").format(err=err))
+                            return False
+                        GLib.idle_add(on_fail_install)
+                else:
+                    def on_tar():
+                        self._append_log(_("[update] Tarball downloaded to {path}. Please extract manually.").format(path=dest))
+                        self.toast(_("Update downloaded to {path}").format(path=dest))
+                        return False
+                    GLib.idle_add(on_tar)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _updates_page(self, dialog: Optional[Adw.PreferencesDialog] = None) -> Adw.PreferencesPage:
+        page = Adw.PreferencesPage(title=_("Updates"), icon_name="software-update-available-symbolic")
+        group = Adw.PreferencesGroup(
+            title=_("Application Updates"),
+            description=_("Check for new releases with bug fixes, protocol improvements, and security updates."))
+
+        ver_row = Adw.ActionRow(
+            title=_("Current Version"),
+            subtitle=f"v{VERSION}"
+        )
+        group.add(ver_row)
+
+        check_row = Adw.ActionRow(
+            title=_("Check for Updates"),
+            subtitle=_("Query GitHub for the latest release")
+        )
+        check_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, valign=Gtk.Align.CENTER)
+        check_spinner = Gtk.Spinner()
+        check_spinner.set_visible(False)
+        check_btn = Gtk.Button(label=_("Check Now"), css_classes=["suggested-action", "pill"])
+
+        def on_check_clicked(_btn):
+            check_btn.set_sensitive(False)
+            check_spinner.set_visible(True)
+            check_spinner.start()
+
+            def task():
+                info = None
+                err = ""
+                try:
+                    info = updater.check_for_updates()
+                except Exception as ex:
+                    err = str(ex)
+
+                def deliver():
+                    check_btn.set_sensitive(True)
+                    check_spinner.stop()
+                    check_spinner.set_visible(False)
+                    if info:
+                        self._prompt_update(info, manual=True)
+                    elif err:
+                        msg = _("Could not check for updates: {err}").format(err=err)
+                        if dialog and hasattr(dialog, "add_toast"):
+                            dialog.add_toast(Adw.Toast.new(msg))
+                        else:
+                            self.toast(msg)
+                    else:
+                        msg = _("You are running the latest version (v{ver})").format(ver=VERSION)
+                        if dialog and hasattr(dialog, "add_toast"):
+                            dialog.add_toast(Adw.Toast.new(msg))
+                        else:
+                            self.toast(msg)
+                    return False
+                GLib.idle_add(deliver)
+
+            threading.Thread(target=task, daemon=True).start()
+
+        check_btn.connect("clicked", on_check_clicked)
+        check_box.append(check_spinner)
+        check_box.append(check_btn)
+        check_row.add_suffix(check_box)
+        group.add(check_row)
+
+        auto_row = Adw.SwitchRow(
+            title=_("Check for updates on startup"),
+            subtitle=_("Notify automatically when a newer version is published on GitHub")
+        )
+        auto_row.set_active(bool(self.settings.get("check_updates_startup", True)))
+
+        def auto_toggled(row: Adw.SwitchRow, _param):
+            self.settings["check_updates_startup"] = row.props.active
+            save_settings(self.settings)
+
+        auto_row.connect("notify::active", auto_toggled)
+        group.add(auto_row)
+
+        page.add(group)
+        return page
+
 
     def _copy_donation_address(self, _button, address: str,
                                dialog: Optional[Adw.PreferencesDialog] = None) -> None:

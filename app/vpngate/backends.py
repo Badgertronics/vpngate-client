@@ -2077,10 +2077,9 @@ def install_backend_windows(protocol: Protocol,
             url = "https://swupdate.openvpn.org/community/releases/OpenVPN-2.6.12-I001-amd64.msi"
             tmp_path = os.path.join(tempfile.gettempdir(), "openvpn-setup.msi")
             try:
-                import urllib.request
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=45) as resp, open(tmp_path, "wb") as f:
-                    f.write(resp.read())
+                ok = netutil.download_file_resilient(url, tmp_path, timeout=60, log_cb=_log)
+                if not ok or not os.path.isfile(tmp_path) or os.path.getsize(tmp_path) == 0:
+                    raise RuntimeError("Failed to download installer package (empty or missing file)")
                 _log("[install] Launching OpenVPN installer ...")
                 _toast("Please approve the installer to complete setup.")
                 subprocess.Popen(["msiexec.exe", "/i", tmp_path, "/passive", "/norestart"])
@@ -2094,10 +2093,9 @@ def install_backend_windows(protocol: Protocol,
             url = "https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.42-9798-rtm/softether-vpnclient-v4.42-9798-rtm-2023.06.30-windows-x86_x64-intel.exe"
             tmp_path = os.path.join(tempfile.gettempdir(), "softether-vpnclient-setup.exe")
             try:
-                import urllib.request
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=90) as resp, open(tmp_path, "wb") as f:
-                    f.write(resp.read())
+                ok = netutil.download_file_resilient(url, tmp_path, timeout=120, log_cb=_log)
+                if not ok or not os.path.isfile(tmp_path) or os.path.getsize(tmp_path) == 0:
+                    raise RuntimeError("Failed to download installer package (empty or missing file)")
                 _log("[install] Launching SoftEther setup wizard ...")
                 _toast("Please complete the SoftEther setup wizard.")
                 os.startfile(tmp_path)

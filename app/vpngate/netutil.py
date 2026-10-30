@@ -9,7 +9,7 @@ import struct
 import subprocess
 import sys
 import time
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Process helpers
@@ -372,26 +372,69 @@ def which(program: str) -> str:
     return shutil.which(program) or ""
 
 
-def measure_server_latency(server, timeout: float = 1.5) -> int:
+def measure_server_latency(server, timeout: float = 0.8) -> int:
     """Measure real network latency to a VPN server in milliseconds.
 
-    Executes a fast single-packet ICMP echo request, and falls back to a TCP
-    SYN handshake on port 443 / VPN port to bypass ICMP drops or DPI censorship.
+    Executes a fast in-process TCP SYN handshake directly to the VPN port
+    (SSL-VPN / SSTP / OpenVPN or 443). If TCP is unresponsive, performs a fast
+    ICMP echo ping.
     Returns latency in milliseconds (>= 1), or -1 if unreachable / timed out.
     """
     ip = getattr(server, "ip", "") or ""
     if not ip:
         return -1
 
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    # 1. Fast direct TCP socket handshake on active VPN ports (in-process, low latency)
+    ports: List[int] = []
+    sstp_port = getattr(server, "sstp_port", None)
+    if sstp_port:
+        try:
+            ports.append(int(sstp_port))
+        except (ValueError, TypeError):
+            pass
+    ssl_vpn_port = getattr(server, "ssl_vpn_port", None)
+    if ssl_vpn_port:
+        try:
+            p_int = int(ssl_vpn_port)
+            if p_int not in ports:
+                ports.append(p_int)
+        except (ValueError, TypeError):
+            pass
+    openvpn_tcp = getattr(server, "openvpn_tcp", None)
+    if openvpn_tcp:
+        try:
+            p_int = int(openvpn_tcp)
+            if p_int not in ports:
+                ports.append(p_int)
+        except (ValueError, TypeError):
+            pass
+    if 443 not in ports:
+        ports.append(443)
 
-    # 1. Try ICMP ping (fast single packet)
+    tcp_timeout = min(timeout, 0.7)
+    for p in ports[:2]:
+        t0 = time.perf_counter()
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(tcp_timeout)
+            err = s.connect_ex((ip, p))
+            s.close()
+            dt = int((time.perf_counter() - t0) * 1000)
+            # 0 = connected; 10061 (Win) or 111 (Linux) = connection refused (host is alive and replied with RST)
+            if err in (0, 10061, 111):
+                return max(1, dt)
+        except Exception:
+            pass
+
+    # 2. Fast ICMP fallback (0.6s)
     try:
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        icmp_timeout = min(timeout, 0.6)
         if sys.platform == "win32":
-            cmd = ["ping", "-n", "1", "-w", str(int(timeout * 1000)), ip]
+            cmd = ["ping", "-n", "1", "-w", str(int(icmp_timeout * 1000)), ip]
         else:
-            cmd = ["ping", "-c", "1", "-W", str(max(1, int(timeout))), ip]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 0.5,
+            cmd = ["ping", "-c", "1", "-W", "1", ip]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=icmp_timeout + 0.5,
                              creationflags=creation_flags)
         if res.returncode == 0:
             out = res.stdout.lower()
@@ -401,32 +444,125 @@ def measure_server_latency(server, timeout: float = 1.5) -> int:
     except Exception:
         pass
 
-    # 2. Fallback: TCP SYN handshake on port 443 or VPN port
-    ports = []
-    sstp_port = getattr(server, "sstp_port", None)
-    if sstp_port:
-        ports.append(sstp_port)
-    ssl_vpn_port = getattr(server, "ssl_vpn_port", None)
-    if ssl_vpn_port:
-        ports.append(ssl_vpn_port)
-    openvpn_tcp = getattr(server, "openvpn_tcp", None)
-    if openvpn_tcp:
-        ports.append(openvpn_tcp)
-    if 443 not in ports:
-        ports.append(443)
-
-    for p in ports:
-        t0 = time.time()
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(timeout)
-            err = s.connect_ex((ip, int(p)))
-            s.close()
-            # 0 means connection accepted; 10061 (Win) or 111 (Linux) means connection
-            # refused, which also confirms the remote host is alive and reachable.
-            if err in (0, 10061, 111):
-                return max(1, int((time.time() - t0) * 1000))
-        except Exception:
-            pass
-
     return -1
+
+
+def download_file_resilient(url: str, dest_path: str, timeout: int = 120,
+                            log_cb: Optional[Callable[[str], None]] = None) -> bool:
+    """Download a file with high resilience against missing root CAs and proxies.
+
+    Tries native curl.exe with -k -L first, then falls back to urllib with an
+    unverified SSL context, and finally PowerShell on Windows.
+    Returns True if dest_path was created with size > 0, False otherwise.
+    """
+    def _log(msg: str) -> None:
+        if log_cb:
+            log_cb(msg)
+
+    # Clean existing destination if any
+    try:
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+    except Exception:
+        pass
+
+    # 1. Try native curl binary (handles system certificates, redirects, -k)
+    curl_candidates = [
+        "curl.exe" if sys.platform == "win32" else "curl",
+        "C:\\Windows\\System32\\curl.exe",
+        shutil.which("curl.exe") if sys.platform == "win32" else shutil.which("curl"),
+    ]
+    curl_bin = next((c for c in curl_candidates if c and (os.path.isfile(c) or shutil.which(c))), None)
+
+    if curl_bin:
+        try:
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            cmd = [
+                curl_bin, "-L", "-k", "--fail", "--retry", "2",
+                "--connect-timeout", "15", "-m", str(timeout),
+                "-o", dest_path, url
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=timeout + 5, creationflags=creation_flags)
+            if res.returncode == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                return True
+        except Exception as exc:
+            _log(f"[download] curl attempt failed: {exc}")
+
+    # 2. Fallback: Python urllib with resilient SSL context
+    try:
+        import urllib.request
+        import ssl
+        ctx = ssl._create_unverified_context()
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VPN-Gate-Client"}
+        )
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+            with open(dest_path, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+            return True
+    except Exception as exc:
+        _log(f"[download] urllib attempt failed: {exc}")
+
+    # 3. Windows PowerShell WebClient fallback
+    if sys.platform == "win32":
+        try:
+            ps_cmd = (
+                "[Net.ServicePointManager]::SecurityProtocol = "
+                "[Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13; "
+                f"(New-Object Net.WebClient).DownloadFile('{url}', '{dest_path}')"
+            )
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            res = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                                 capture_output=True, text=True, timeout=timeout + 10,
+                                 creationflags=creation_flags)
+            if res.returncode == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                return True
+        except Exception as exc:
+            _log(f"[download] powershell attempt failed: {exc}")
+
+    return False
+
+
+def download_json_resilient(url: str, timeout: int = 15) -> Optional[dict]:
+    """Fetch JSON with resilient SSL handling."""
+    import json
+    import ssl
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "VPN-Gate-Client",
+                "Accept": "application/vnd.github.v3+json"
+            }
+        )
+        ctx = ssl._create_unverified_context()
+        with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+            data = resp.read().decode("utf-8", "replace")
+            return json.loads(data)
+    except Exception:
+        # Try curl if python urllib failed
+        curl_candidates = [
+            "curl.exe" if sys.platform == "win32" else "curl",
+            "C:\\Windows\\System32\\curl.exe",
+            shutil.which("curl.exe") if sys.platform == "win32" else shutil.which("curl"),
+        ]
+        curl_bin = next((c for c in curl_candidates if c and (os.path.isfile(c) or shutil.which(c))), None)
+        if curl_bin:
+            try:
+                creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                cmd = [curl_bin, "-s", "-L", "-k", "--connect-timeout", "10", "-m", str(timeout), url]
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2, creationflags=creation_flags)
+                if res.returncode == 0 and res.stdout:
+                    return json.loads(res.stdout)
+            except Exception:
+                pass
+    return None
+
