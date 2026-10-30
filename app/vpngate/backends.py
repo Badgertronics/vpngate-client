@@ -918,19 +918,44 @@ def _cleanup_windows_ras(vpn_name: str, target_ips: Optional[set] = None) -> Non
     """Safely terminate stuck rasdial processes and cleanly remove the Windows VPN profile."""
     if sys.platform != "win32":
         return
-    subprocess.run(["taskkill", "/F", "/IM", "rasdial.exe"],
-                   capture_output=True, text=True, timeout=5)
-    subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
-                   capture_output=True, text=True, timeout=10)
-    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                    f"rasphone -h '{vpn_name}' 2>$null; "
-                    f"Get-VpnConnection -Name '{vpn_name}' -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue; "
-                    f"Get-VpnConnection -Name '{vpn_name}' -AllUserConnection -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue"],
-                   capture_output=True, text=True, timeout=10)
-    _remove_windows_vpn_pbk_entry(vpn_name)
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    names_to_clean = set(filter(None, [vpn_name, "VPNGate", "VPNGate2"]))
+    for name in names_to_clean:
+        try:
+            subprocess.run(["rasdial", name, "/DISCONNECT"],
+                           capture_output=True, text=True, timeout=5, creationflags=creation_flags)
+        except Exception:
+            pass
+        try:
+            subprocess.run(["rasphone", "-h", name],
+                           capture_output=True, text=True, timeout=5, creationflags=creation_flags)
+        except Exception:
+            pass
+        _remove_windows_vpn_pbk_entry(name)
+
+    try:
+        subprocess.run(["taskkill", "/F", "/IM", "rasdial.exe"],
+                       capture_output=True, text=True, timeout=5, creationflags=creation_flags)
+    except Exception:
+        pass
+
+    try:
+        ps_cleanup = " ".join([
+            f"Get-VpnConnection -Name '{n}' -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue; "
+            f"Get-VpnConnection -Name '{n}' -AllUserConnection -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue;"
+            for n in names_to_clean
+        ])
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cleanup],
+                       capture_output=True, text=True, timeout=15, creationflags=creation_flags)
+    except Exception:
+        pass
+
     if target_ips:
         for tip in target_ips:
-            subprocess.run(["route", "delete", tip], capture_output=True, text=True, timeout=5)
+            try:
+                subprocess.run(["route", "delete", tip], capture_output=True, text=True, timeout=5, creationflags=creation_flags)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1019,8 +1044,11 @@ class SstpBackend(Backend):
         if host and "." not in host:
             host = f"{host}.opengw.net"
 
-        vpn_name = "VPNGate"
-        _log_emit(emit, f"[sstp 1/3] Configuring native Windows MS-SSTP connection to {host} ...")
+        # Alternate profile name between VPNGate and VPNGate2 to avoid Error 756
+        # if Windows RasMan is still releasing the previous entry.
+        SstpBackend._vpn_index = getattr(SstpBackend, "_vpn_index", 0) + 1
+        vpn_name = "VPNGate" if SstpBackend._vpn_index % 2 != 0 else "VPNGate2"
+        _log_emit(emit, f"[sstp 1/3] Configuring native Windows MS-SSTP connection to {host} ({vpn_name}) ...")
         started = time.monotonic()
 
         _cleanup_windows_ras(vpn_name)
@@ -1035,13 +1063,17 @@ class SstpBackend(Backend):
             f"-SplitTunneling:$false -Force"
         )
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        res = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_add],
-            capture_output=True, text=True, timeout=30, creationflags=creation_flags
-        )
-        if res.returncode != 0:
-            err = res.stderr.strip() or res.stdout.strip()
-            raise BackendError(f"Failed to create Windows VPN profile for MS-SSTP: {err}")
+        try:
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_add],
+                capture_output=True, text=True, timeout=45, creationflags=creation_flags
+            )
+            if res.returncode != 0:
+                err = res.stderr.strip() or res.stdout.strip()
+                raise BackendError(f"Failed to create Windows VPN profile for MS-SSTP: {err}")
+        except subprocess.TimeoutExpired:
+            raise BackendError("Windows PowerShell timed out while creating the VPN profile. System may be slow or overloaded.")
+
         self._configure_windows_vpn_pbk(vpn_name)
 
         # Add static host route to server IP via physical gateway to prevent route loops
@@ -1058,8 +1090,11 @@ class SstpBackend(Backend):
         if physical_gw and target_ips:
             for tip in target_ips:
                 _log_emit(emit, f"[sstp] Routing {tip}/32 via physical gateway {physical_gw} ...")
-                subprocess.run(["route", "add", tip, "mask", "255.255.255.255", physical_gw, "metric", "1"],
-                               capture_output=True, text=True, timeout=10, creationflags=creation_flags)
+                try:
+                    subprocess.run(["route", "add", tip, "mask", "255.255.255.255", physical_gw, "metric", "1"],
+                                   capture_output=True, text=True, timeout=10, creationflags=creation_flags)
+                except Exception:
+                    pass
 
         _log_emit(emit, f"[sstp 2/3] Dialing {vpn_name} ({host}) via Windows RAS ...")
         self._abort_requested = False
@@ -1109,6 +1144,38 @@ class SstpBackend(Backend):
             if proc.returncode == 0 and "successfully connected" in output.lower():
                 break
 
+            # Handle Error 756: connection is already being dialed
+            if "756" in output or "already being dialed" in output.lower():
+                _log_emit(emit, f"[rasdial] Windows RAS reported connection busy (Error 756); sending hang-up signal ...")
+                try:
+                    subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
+                                   capture_output=True, text=True, timeout=5, creationflags=creation_flags)
+                    subprocess.run(["rasphone", "-h", vpn_name],
+                                   capture_output=True, text=True, timeout=5, creationflags=creation_flags)
+                except Exception:
+                    pass
+                if not self._abort_requested:
+                    time.sleep(2.0)
+                    try:
+                        proc = subprocess.Popen(
+                            ["rasdial", vpn_name, VPN_USERNAME, VPN_PASSWORD],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            creationflags=creation_flags
+                        )
+                        self._active_proc = proc
+                        out, err = proc.communicate(timeout=timeout)
+                        output = (out or "") + (err or "")
+                        for line in output.splitlines():
+                            line = line.strip()
+                            if line:
+                                _log_emit(emit, f"[rasdial] {line}")
+                        if proc.returncode == 0 and "successfully connected" in output.lower():
+                            break
+                    except Exception:
+                        pass
+                    finally:
+                        self._active_proc = None
+
             last_error = output.strip().splitlines()[-1] if output.strip() else "connection failed"
             if attempt < retries and not self._abort_requested:
                 _log_emit(emit, f"[sstp] Attempt {attempt}/{retries} failed ({last_error}), retrying ...")
@@ -1122,11 +1189,14 @@ class SstpBackend(Backend):
             self.abort(emit)
             raise BackendError("Connection aborted by user.")
 
-        subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-             f"Set-NetIPInterface -InterfaceAlias '{vpn_name}' -InterfaceMetric 1 -ErrorAction SilentlyContinue"],
-            capture_output=True, text=True, timeout=10
-        )
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 f"Set-NetIPInterface -InterfaceAlias '{vpn_name}' -InterfaceMetric 1 -ErrorAction SilentlyContinue"],
+                capture_output=True, text=True, timeout=10, creationflags=creation_flags
+            )
+        except Exception:
+            pass
         _log_emit(emit, f"[sstp 3/3] Connected in {_since(started)}: Windows MS-SSTP tunnel is active")
         return {
             "protocol": protocol.value,
@@ -1372,8 +1442,11 @@ class L2tpBackend(Backend):
     def _connect_windows(self, server: VpnServer, protocol: Protocol, emit: Emit,
                          workdir: str, timeout: int = 30, retries: int = 1) -> dict:
         host = server.ip or server.hostname
-        vpn_name = "VPNGate"
-        _log_emit(emit, f"[l2tp 1/3] Configuring native Windows L2TP/IPsec connection to {host} ...")
+        # Alternate profile name between VPNGate and VPNGate2 to avoid Error 756
+        # if Windows RasMan is still releasing the previous entry.
+        L2tpBackend._vpn_index = getattr(L2tpBackend, "_vpn_index", 0) + 1
+        vpn_name = "VPNGate" if L2tpBackend._vpn_index % 2 != 0 else "VPNGate2"
+        _log_emit(emit, f"[l2tp 1/3] Configuring native Windows L2TP/IPsec connection to {host} ({vpn_name}) ...")
         started = time.monotonic()
 
         _cleanup_windows_ras(vpn_name)
@@ -1388,13 +1461,17 @@ class L2tpBackend(Backend):
             f"-SplitTunneling:$false -Force"
         )
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        res = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_add],
-            capture_output=True, text=True, timeout=30, creationflags=creation_flags
-        )
-        if res.returncode != 0:
-            err = res.stderr.strip() or res.stdout.strip()
-            raise BackendError(f"Failed to create Windows VPN profile for L2TP/IPsec: {err}")
+        try:
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_add],
+                capture_output=True, text=True, timeout=45, creationflags=creation_flags
+            )
+            if res.returncode != 0:
+                err = res.stderr.strip() or res.stdout.strip()
+                raise BackendError(f"Failed to create Windows VPN profile for L2TP/IPsec: {err}")
+        except subprocess.TimeoutExpired:
+            raise BackendError("Windows PowerShell timed out while creating the VPN profile. System may be slow or overloaded.")
+
         SstpBackend._configure_windows_vpn_pbk(vpn_name)
 
         # Add static host route to server IP via physical gateway to prevent route loops
@@ -1411,8 +1488,11 @@ class L2tpBackend(Backend):
         if physical_gw and target_ips:
             for tip in target_ips:
                 _log_emit(emit, f"[l2tp] Routing {tip}/32 via physical gateway {physical_gw} ...")
-                subprocess.run(["route", "add", tip, "mask", "255.255.255.255", physical_gw, "metric", "1"],
-                               capture_output=True, text=True, timeout=10, creationflags=creation_flags)
+                try:
+                    subprocess.run(["route", "add", tip, "mask", "255.255.255.255", physical_gw, "metric", "1"],
+                                   capture_output=True, text=True, timeout=10, creationflags=creation_flags)
+                except Exception:
+                    pass
 
         _log_emit(emit, f"[l2tp 2/3] Dialing {vpn_name} ({host}) via Windows RAS with PSK ...")
         self._abort_requested = False
@@ -1462,6 +1542,38 @@ class L2tpBackend(Backend):
             if proc.returncode == 0 and "successfully connected" in output.lower():
                 break
 
+            # Handle Error 756: connection is already being dialed
+            if "756" in output or "already being dialed" in output.lower():
+                _log_emit(emit, f"[rasdial] Windows RAS reported connection busy (Error 756); sending hang-up signal ...")
+                try:
+                    subprocess.run(["rasdial", vpn_name, "/DISCONNECT"],
+                                   capture_output=True, text=True, timeout=5, creationflags=creation_flags)
+                    subprocess.run(["rasphone", "-h", vpn_name],
+                                   capture_output=True, text=True, timeout=5, creationflags=creation_flags)
+                except Exception:
+                    pass
+                if not self._abort_requested:
+                    time.sleep(2.0)
+                    try:
+                        proc = subprocess.Popen(
+                            ["rasdial", vpn_name, VPN_USERNAME, VPN_PASSWORD],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                            creationflags=creation_flags
+                        )
+                        self._active_proc = proc
+                        out, err = proc.communicate(timeout=timeout)
+                        output = (out or "") + (err or "")
+                        for line in output.splitlines():
+                            line = line.strip()
+                            if line:
+                                _log_emit(emit, f"[rasdial] {line}")
+                        if proc.returncode == 0 and "successfully connected" in output.lower():
+                            break
+                    except Exception:
+                        pass
+                    finally:
+                        self._active_proc = None
+
             last_error = output.strip().splitlines()[-1] if output.strip() else "connection failed"
             if attempt < retries and not self._abort_requested:
                 _log_emit(emit, f"[l2tp] Attempt {attempt}/{retries} failed ({last_error}), retrying ...")
@@ -1475,12 +1587,14 @@ class L2tpBackend(Backend):
             self.abort(emit)
             raise BackendError("Connection aborted by user.")
 
-        subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-             f"Set-NetIPInterface -InterfaceAlias '{vpn_name}' -InterfaceMetric 1 -ErrorAction SilentlyContinue"],
-            capture_output=True, text=True, timeout=10, creationflags=creation_flags
-        )
-
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 f"Set-NetIPInterface -InterfaceAlias '{vpn_name}' -InterfaceMetric 1 -ErrorAction SilentlyContinue"],
+                capture_output=True, text=True, timeout=10, creationflags=creation_flags
+            )
+        except Exception:
+            pass
         _log_emit(emit, f"[l2tp 3/3] Connected in {_since(started)}: Windows L2TP/IPsec tunnel is active")
         return {
             "protocol": protocol.value,

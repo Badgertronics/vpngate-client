@@ -343,19 +343,28 @@ def quick_stack(servers: List[VpnServer], limit: int = 3) -> List[VpnServer]:
 
 
 def _clean_probe_err(err: Exception | str) -> str:
-    s = str(err).strip()
-    m = re.match(r"^<urlopen error (.*)>$", s)
+    if isinstance(err, Exception) and hasattr(err, "reason"):
+        s = str(err.reason).strip()
+    else:
+        s = str(err or "").strip()
+    m = re.search(r"urlopen error (.*)", s, flags=re.IGNORECASE)
     if m:
         s = m.group(1).strip()
-    elif s.startswith("<") and s.endswith(">"):
-        s = s[1:-1].strip()
-    if "timed out" in s.lower():
+    s = s.replace("<", "").replace(">", "").strip()
+    s_lower = s.lower()
+    if "timed out" in s_lower or "timeout" in s_lower:
         return "Connection timed out"
-    if "connection refused" in s.lower():
+    if "connection refused" in s_lower:
         return "Connection refused"
-    if "name or service not known" in s.lower() or "nodename nor servname" in s.lower():
+    if "name or service not known" in s_lower or "nodename nor servname" in s_lower or "getaddrinfo failed" in s_lower:
         return "DNS lookup failed"
-    return s
+    if "certificate" in s_lower or "ssl" in s_lower or "handshake" in s_lower:
+        return "SSL/TLS handshake failed"
+    if "network is unreachable" in s_lower or "host is unreachable" in s_lower:
+        return "Network unreachable"
+    if "connection reset" in s_lower:
+        return "Connection reset by peer"
+    return s or "Connection failed"
 
 
 def probe_target_detailed(target: str, timeout: float = 3.5) -> tuple[bool, int, str]:

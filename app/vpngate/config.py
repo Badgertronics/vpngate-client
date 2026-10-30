@@ -3,7 +3,7 @@ import sys
 
 APP_NAME = "VPN Gate Client"
 APP_ID = "com.vpngate.client"
-VERSION = "1.0.16"
+VERSION = "1.0.17"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -113,12 +113,14 @@ CONNECT_TIMEOUT = 45
 # Seconds to wait for a SoftEther session to be established.
 SOFTETHER_TIMEOUT = 60
 
-# Default target endpoints (IPs/hostnames) probed to detect connection loss
+# Default target endpoints (IPs/hostnames) probed to detect connection loss.
+# Includes popular services frequently censored in restricted regions (e.g. YouTube, Google, Cloudflare).
 DEFAULT_CONNECTIVITY_TARGETS = [
+    "youtube.com",
+    "google.com",
+    "cloudflare.com",
     "1.1.1.1",
     "8.8.8.8",
-    "1.0.0.1",
-    "9.9.9.9",
 ]
 
 # ---------------------------------------------------------------------------
