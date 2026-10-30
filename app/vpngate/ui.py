@@ -39,6 +39,8 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, GLib, Gdk, Gio, Gtk, Pango  # noqa: E402
 
 from . import fetcher, privilege                      # noqa: E402
+from .backends import BACKENDS, install_backend_windows  # noqa: E402
+from .netutil import measure_server_latency           # noqa: E402
 from .config import (APP_NAME, DEFAULT_CONNECT_RETRIES, DEFAULT_CONNECT_TIMEOUT,  # noqa: E402
                      DEFAULT_CONNECTIVITY_TARGETS, DEFAULT_MIRRORS,
                      DEFAULT_PROBE_TIMEOUT, DEFAULT_WATCHDOG_INTERVAL,
@@ -93,7 +95,7 @@ def _make_spin_row(title: str, subtitle: str, min_v: float, max_v: float, step: 
 class _SheetFallback(Gtk.Box):
     """Container with a stretchable bottom log drawer."""
 
-    def __init__(self, content: Gtk.Widget, initial_height: int = 240) -> None:
+    def __init__(self, content: Gtk.Widget, initial_height: int = 140) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self._content = content
         self._content.set_vexpand(True)
@@ -265,6 +267,7 @@ def _server_from_dict(item: dict) -> VpnServer:
 _SORT_MODES = (
     "recommended",
     "speed",
+    "real_ping",
     "ping",
     "sessions_asc",
     "sessions_desc",
@@ -280,6 +283,12 @@ def sort_servers(servers: List[VpnServer], mode: str) -> List[VpnServer]:
     out = list(servers)
     if mode == "speed":
         out.sort(key=lambda s: (-s.speed_mbps, s.ping_ms or 0))
+    elif mode == "real_ping":
+        out.sort(key=lambda s: (
+            s.real_ping_ms if (getattr(s, "real_ping_ms", None) is not None and s.real_ping_ms > 0) else 999999,
+            s.ping_ms or 99999,
+            -s.speed_mbps
+        ))
     elif mode == "ping":
         out.sort(key=lambda s: (s.ping_ms or 99999, -s.speed_mbps))
     elif mode == "sessions_asc":
@@ -800,7 +809,8 @@ class VpnGateWindow(Adw.ApplicationWindow):
         sort_items = [
             _("Recommended"),
             _("Fastest speed"),
-            _("Lowest ping (latency)"),
+            _("Lowest real delay (ping)"),
+            _("Lowest reported ping"),
             _("Lowest sessions"),
             _("Highest sessions"),
             _("Longest uptime"),
@@ -813,6 +823,15 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self.sort_dd.set_selected(0)
         self.sort_dd.connect("notify::selected-item", self._on_sort_changed)
         row_top.append(self.sort_dd)
+
+        self.ping_all_btn = Gtk.Button(
+            label=_("Ping All"),
+            icon_name="network-transmit-receive-symbolic",
+            tooltip_text=_("Ping all servers to test real reachability and delay"),
+            css_classes=["flat"]
+        )
+        self.ping_all_btn.connect("clicked", self._on_ping_all_clicked)
+        row_top.append(self.ping_all_btn)
         self.filters.append(row_top)
 
         row_bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -837,6 +856,134 @@ class VpnGateWindow(Adw.ApplicationWindow):
     def _on_sort_changed(self, dropdown: Gtk.DropDown, _param) -> None:
         self._sort = _SORT_MODES[dropdown.get_selected()]
         self._apply_filters()
+
+    def _update_server_row_ping(self, server: VpnServer) -> None:
+        for idx, s in self._row_for.items():
+            if s is server or s.ip == server.ip:
+                row = self._rows.get(idx)
+                if row and hasattr(row, "_ping_chip"):
+                    chip = row._ping_chip
+                    ms = getattr(server, "real_ping_ms", None)
+                    if ms is not None:
+                        if ms < 0:
+                            chip.set_text(_("Offline"))
+                            chip.set_tooltip_text(_("Tested latency: Unreachable (timed out)"))
+                            for c in ("chip-ping-ok", "chip-ping-mid", "chip-ping-slow"):
+                                chip.remove_css_class(c)
+                            chip.add_css_class("chip-ping-slow")
+                        else:
+                            chip.set_text(f"{ms} ms")
+                            tip = _("Tested latency: {real} ms (Reported: {rep} ms)").format(
+                                real=ms, rep=server.ping_ms) if server.ping_ms > 0 else f"Tested: {ms} ms"
+                            chip.set_tooltip_text(tip)
+                            for c in ("chip-ping-ok", "chip-ping-mid", "chip-ping-slow"):
+                                chip.remove_css_class(c)
+                            chip.add_css_class("chip-ping-ok" if ms <= 120 else ("chip-ping-mid" if ms <= 320 else "chip-ping-slow"))
+                break
+
+    def _ping_single_server(self, server: VpnServer) -> None:
+        host = server.hostname or server.ip
+        self._append_log(_("[ping] Testing latency to {host} ({ip}) ...").format(host=host, ip=server.ip))
+
+        def worker():
+            ms = measure_server_latency(server, timeout=2.0)
+            server.real_ping_ms = ms
+
+            def deliver():
+                if ms >= 0:
+                    self._append_log(_("[ping] ✓ {host} ({ip}): {ms} ms latency").format(
+                        host=host, ip=server.ip, ms=ms))
+                    self.toast(_("{host}: {ms} ms").format(host=host, ms=ms))
+                else:
+                    self._append_log(_("[ping] ✗ {host} ({ip}) is unreachable").format(
+                        host=host, ip=server.ip))
+                    self.toast(_("{host} is unreachable").format(host=host))
+                self._update_server_row_ping(server)
+                if self.selected is server:
+                    self._show_details(server)
+                if self._sort == "real_ping":
+                    self._apply_filters()
+                return False
+
+            GLib.idle_add(deliver)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_ping_all_clicked(self, *_) -> None:
+        if getattr(self, "_pinging_all", False):
+            self._ping_cancel = True
+            self.ping_all_btn.set_label(_("Stopping..."))
+            self.ping_all_btn.set_sensitive(False)
+            self._append_log(_("[ping] Stopping latency testing ..."))
+            return
+
+        servers_to_ping = list(self.servers)
+        if not servers_to_ping:
+            self.toast(_("No servers to ping"))
+            return
+
+        self._pinging_all = True
+        self._ping_cancel = False
+        self.ping_all_btn.set_label(_("Stop Ping"))
+        self.ping_all_btn.set_icon_name("process-stop-symbolic")
+        self.ping_all_btn.add_css_class("destructive-action")
+        self._append_log(_("[ping] Testing real latency for {count} servers (concurrent) ...").format(count=len(servers_to_ping)))
+
+        def worker():
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            reachable_count = 0
+            unreachable_count = 0
+            completed = 0
+            total = len(servers_to_ping)
+
+            with ThreadPoolExecutor(max_workers=14) as executor:
+                future_to_server = {
+                    executor.submit(measure_server_latency, s, 1.5): s
+                    for s in servers_to_ping
+                }
+                for future in as_completed(future_to_server):
+                    if getattr(self, "_ping_cancel", False):
+                        break
+                    s = future_to_server[future]
+                    try:
+                        ms = future.result()
+                    except Exception:
+                        ms = -1
+                    s.real_ping_ms = ms
+                    completed += 1
+                    if ms >= 0:
+                        reachable_count += 1
+                    else:
+                        unreachable_count += 1
+
+                    def update_one(srv=s, c=completed):
+                        if getattr(self, "_pinging_all", False) and not getattr(self, "_ping_cancel", False):
+                            self.ping_all_btn.set_label(_("Stop ({done}/{total})").format(done=c, total=total))
+                        self._update_server_row_ping(srv)
+                        if self.selected is srv:
+                            self._show_details(srv)
+                        return False
+                    GLib.idle_add(update_one)
+
+            def done():
+                self._pinging_all = False
+                self._ping_cancel = False
+                self.ping_all_btn.set_label(_("Ping All"))
+                self.ping_all_btn.set_icon_name("network-transmit-receive-symbolic")
+                self.ping_all_btn.remove_css_class("destructive-action")
+                self.ping_all_btn.set_sensitive(True)
+                msg = _("[ping] Completed: {ok} reachable, {bad} unreachable").format(
+                    ok=reachable_count, bad=unreachable_count)
+                self._append_log(msg)
+                self.toast(_("Ping completed: {ok} reachable, {bad} unreachable").format(
+                    ok=reachable_count, bad=unreachable_count))
+                if self._sort == "real_ping":
+                    self._apply_filters()
+                return False
+
+            GLib.idle_add(done)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _on_search_changed(self, *args) -> None:       # noqa: ANN001
         # debounce: do not rebuild the whole card list per keystroke
@@ -957,7 +1104,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
 
     # -- log bottom sheet --------------------------------------------------------
     def _build_sheet(self) -> Gtk.Widget:
-        initial_h = self.settings.get("log_height", 240)
+        initial_h = self.settings.get("log_height", 140)
         sheet = _SheetFallback(self.split, initial_height=initial_h)
 
         panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
@@ -1362,7 +1509,19 @@ class VpnGateWindow(Adw.ApplicationWindow):
                                    label=speed_text
                                    if server.speed_mbps else "—"))
         right.append(speed_box)
-        right.append(ping_chip(server.ping_ms))
+
+        ping_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6, halign=Gtk.Align.END)
+        p_chip = ping_chip(server.ping_ms, getattr(server, "real_ping_ms", None))
+        row._ping_chip = p_chip
+        ping_box.append(p_chip)
+
+        ping_btn = Gtk.Button(icon_name="network-transmit-receive-symbolic",
+                              css_classes=["flat", "circular"],
+                              tooltip_text=_("Ping this server to test latency"))
+        ping_btn.connect("clicked", lambda _b, s=server: self._ping_single_server(s))
+        ping_box.append(ping_btn)
+
+        right.append(ping_box)
         line.append(right)
         row.set_child(line)
         return row
@@ -1388,9 +1547,16 @@ class VpnGateWindow(Adw.ApplicationWindow):
         host = server.hostname or server.ip
         self.details_host.set_text("{}\nIP {}\nISP {}".format(
             host, server.ip or "—", server.isp_hostname or "—"))
+        ping_val = server.ping_text
+        if getattr(server, "real_ping_ms", None) is not None:
+            if server.real_ping_ms < 0:
+                ping_val = _("Offline (unreachable) · reported {rep}").format(rep=server.ping_text)
+            else:
+                ping_val = _("{real} ms (real delay) · reported {rep}").format(
+                    real=server.real_ping_ms, rep=server.ping_text)
         values = {
             "speed": server.speed_text,
-            "ping": server.ping_text,
+            "ping": ping_val,
             "sessions": server.sessions_text,
             "uptime": server.uptime or "—",
             "users": f"{server.total_users:,}" if server.total_users else "—",
@@ -1495,6 +1661,13 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self.toast(_("{host} does not speak this protocol").format(
                 host=server.hostname or server.ip))
             return
+
+        if sys.platform == "win32" and protocol in (Protocol.OPENVPN, Protocol.SSLVP):
+            backend = BACKENDS.get(protocol)
+            if backend and not backend.available():
+                self._prompt_missing_backend_windows(server, protocol)
+                return
+
         self._aborting = False
         self._hide_chips()
         timeout = int(self.settings.get("connect_timeout", DEFAULT_CONNECT_TIMEOUT))
@@ -1530,6 +1703,43 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self._aborting = False
             self._set_state("idle", _("Connection attempt stopped."))
         self._update_buttons()
+
+    def _prompt_missing_backend_windows(self, server: VpnServer, protocol: Protocol) -> None:
+        proto_name = "OpenVPN" if protocol == Protocol.OPENVPN else "SoftEther (SSL-VPN)"
+        dialog = Adw.AlertDialog(
+            heading=_("{name} Not Installed").format(name=proto_name),
+            body=_("The {name} client is required for this connection.\n\n"
+                   "You can install it automatically, or connect immediately using MS-SSTP "
+                   "(built into Windows without needing any extra software).").format(name=proto_name)
+        )
+        dialog.add_response("cancel", _("Cancel"))
+        dialog.add_response("sstp", _("Switch to MS-SSTP"))
+        dialog.add_response("install", _("Install {name}").format(name=proto_name))
+        dialog.set_response_appearance("install", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("install")
+        dialog.set_close_response("cancel")
+
+        def on_response(_d, response_id):
+            if response_id == "sstp":
+                fallback = Protocol.SSTP if server.supports(Protocol.SSTP) else Protocol.L2TP
+                self._protocol_choice[server.hostname or server.ip] = fallback.value
+                if self.selected is server:
+                    self.details_proto.set_active(fallback.value)
+                self._connect(server, fallback)
+            elif response_id == "install":
+                self._install_backend_windows(protocol)
+
+        dialog.connect("response", on_response)
+        dialog.present(self)
+
+    def _install_backend_windows(self, protocol: Protocol) -> None:
+        def log_cb(msg: str) -> None:
+            GLib.idle_add(lambda: (self._append_log(msg), False)[1])
+
+        def toast_cb(msg: str) -> None:
+            GLib.idle_add(lambda: (self.toast(msg), False)[1])
+
+        install_backend_windows(protocol, log_cb=log_cb, toast_cb=toast_cb)
 
     def _hide_chips(self) -> None:
         for chip in (self.chip_server, self.chip_tunnel, self.chip_public,
@@ -1981,10 +2191,51 @@ class VpnGateWindow(Adw.ApplicationWindow):
         dialog.add(self._appearance_page())
         dialog.add(self._timeouts_page(dialog))
         dialog.add(self._connectivity_page(dialog))
+        if sys.platform == "win32":
+            dialog.add(self._vpn_clients_page(dialog))
         dialog.add(self._mirrors_page(dialog))
         dialog.add(self._support_page(dialog))
         dialog.props.search_enabled = False
         dialog.present(self)
+
+    def _vpn_clients_page(self, dialog: Optional[Adw.PreferencesDialog] = None) -> Adw.PreferencesPage:
+        page = Adw.PreferencesPage(title=_("VPN Clients"), icon_name="preferences-system-network-symbolic")
+        group = Adw.PreferencesGroup(
+            title=_("External VPN Clients (Windows)"),
+            description=_("OpenVPN and SoftEther clients enable additional protocols beyond Windows built-in MS-SSTP and L2TP/IPsec."))
+
+        # OpenVPN row
+        ovpn_available = BACKENDS[Protocol.OPENVPN].available()
+        ovpn_bin = BACKENDS[Protocol.OPENVPN]._openvpn_bin()
+        ovpn_row = Adw.ActionRow(
+            title=_("OpenVPN Client"),
+            subtitle=ovpn_bin if ovpn_available else _("Not installed on this PC")
+        )
+        if ovpn_available:
+            ovpn_row.add_suffix(Gtk.Image(icon_name="emblem-ok-symbolic", css_classes=["success"]))
+        else:
+            ovpn_btn = Gtk.Button(label=_("Install OpenVPN"), css_classes=["suggested-action", "pill"])
+            ovpn_btn.connect("clicked", lambda *_: self._install_backend_windows(Protocol.OPENVPN))
+            ovpn_row.add_suffix(ovpn_btn)
+        group.add(ovpn_row)
+
+        # SoftEther row
+        se_available = BACKENDS[Protocol.SSLVP].available()
+        se_bin = BACKENDS[Protocol.SSLVP]._vpncmd_bin()
+        se_row = Adw.ActionRow(
+            title=_("SoftEther SSL-VPN Client"),
+            subtitle=se_bin if se_available else _("Not installed on this PC")
+        )
+        if se_available:
+            se_row.add_suffix(Gtk.Image(icon_name="emblem-ok-symbolic", css_classes=["success"]))
+        else:
+            se_btn = Gtk.Button(label=_("Install SoftEther"), css_classes=["suggested-action", "pill"])
+            se_btn.connect("clicked", lambda *_: self._install_backend_windows(Protocol.SSLVP))
+            se_row.add_suffix(se_btn)
+        group.add(se_row)
+
+        page.add(group)
+        return page
 
     def _appearance_page(self) -> Adw.PreferencesPage:
         page = Adw.PreferencesPage(title=_("Appearance"),

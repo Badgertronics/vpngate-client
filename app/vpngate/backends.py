@@ -21,7 +21,7 @@ import time
 from typing import Callable, Dict, List, Optional
 
 from . import netutil
-from .config import (CONNECT_TIMEOUT, SOFTETHER_HUB, SOFTETHER_TIMEOUT,
+from .config import (BASE_DIR, CONNECT_TIMEOUT, SOFTETHER_HUB, SOFTETHER_TIMEOUT,
                      STATE_DIR, VPN_PASSWORD, VPN_PSK, VPN_USERNAME)
 from .models import Protocol, VpnServer
 
@@ -110,6 +110,17 @@ class OpenVpnBackend(Backend):
     @staticmethod
     def _openvpn_bin() -> str:
         if sys.platform == "win32":
+            bundled = [
+                os.path.join(BASE_DIR, "openvpn", "bin", "openvpn.exe"),
+                os.path.join(BASE_DIR, "openvpn", "openvpn.exe"),
+                os.path.join(BASE_DIR, "_tools", "openvpn", "bin", "openvpn.exe"),
+                os.path.join(BASE_DIR, "_tools", "openvpn", "openvpn.exe"),
+                os.path.join(BASE_DIR, "bin", "openvpn.exe"),
+                os.path.join(BASE_DIR, "openvpn.exe"),
+            ]
+            for p in bundled:
+                if os.path.exists(p):
+                    return p
             for p in (r"C:\Program Files\OpenVPN\bin\openvpn.exe",
                       r"C:\Program Files (x86)\OpenVPN\bin\openvpn.exe"):
                 if os.path.exists(p):
@@ -501,15 +512,28 @@ class SoftEtherBackend(Backend):
 
     @staticmethod
     def _vpncmd_bin() -> str:
+        if sys.platform == "win32":
+            bundled = [
+                os.path.join(BASE_DIR, "softether", "vpncmd_x64.exe"),
+                os.path.join(BASE_DIR, "softether", "vpncmd.exe"),
+                os.path.join(BASE_DIR, "_tools", "softether", "vpncmd_x64.exe"),
+                os.path.join(BASE_DIR, "_tools", "softether", "vpncmd.exe"),
+                os.path.join(BASE_DIR, "bin", "vpncmd.exe"),
+                os.path.join(BASE_DIR, "vpncmd_x64.exe"),
+                os.path.join(BASE_DIR, "vpncmd.exe"),
+            ]
+            for p in bundled:
+                if os.path.exists(p):
+                    return p
+            for p in (r"C:\Program Files\SoftEther VPN Client\vpncmd_x64.exe",
+                      r"C:\Program Files\SoftEther VPN Client\vpncmd.exe",
+                      r"C:\Program Files (x86)\SoftEther VPN Client\vpncmd.exe"):
+                if os.path.exists(p):
+                    return p
         for name in ("vpncmd", "vpncmd_x64", "vpncmd.exe", "vpncmd_x64.exe"):
             found = shutil.which(name)
             if found:
                 return found
-        for p in (r"C:\Program Files\SoftEther VPN Client\vpncmd_x64.exe",
-                  r"C:\Program Files\SoftEther VPN Client\vpncmd.exe",
-                  r"C:\Program Files (x86)\SoftEther VPN Client\vpncmd.exe"):
-            if os.path.exists(p):
-                return p
         return ""
 
     # -- vpncmd helpers ---------------------------------------------------
@@ -2013,3 +2037,73 @@ BACKENDS = {
 
 def backend_for(protocol: Protocol) -> Backend:
     return BACKENDS[protocol]
+
+
+def install_backend_windows(protocol: Protocol,
+                            log_cb: Optional[Callable[[str], None]] = None,
+                            toast_cb: Optional[Callable[[str], None]] = None) -> None:
+    """Download and launch installer for OpenVPN or SoftEther on Windows."""
+    def _log(msg: str) -> None:
+        if log_cb:
+            log_cb(msg)
+
+    def _toast(msg: str) -> None:
+        if toast_cb:
+            toast_cb(msg)
+
+    def worker() -> None:
+        import tempfile
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        if protocol == Protocol.OPENVPN:
+            winget = shutil.which("winget")
+            if winget:
+                _log("[install] Installing OpenVPN via Windows Package Manager (winget) ...")
+                _toast("Installing OpenVPN via winget...")
+                try:
+                    res = subprocess.run([
+                        winget, "install", "--id", "OpenVPNTechnologies.OpenVPN", "-e",
+                        "--silent", "--accept-package-agreements", "--accept-source-agreements"
+                    ], capture_output=True, text=True, timeout=240, creationflags=creation_flags)
+                    if BACKENDS[Protocol.OPENVPN].available():
+                        _log("[install] ✓ OpenVPN installed successfully!")
+                        _toast("OpenVPN installed successfully!")
+                        return
+                except Exception as ex:
+                    _log(f"[install] winget attempt failed ({ex}), trying direct download ...")
+
+            _log("[install] Downloading OpenVPN installer from openvpn.org ...")
+            _toast("Downloading OpenVPN installer...")
+            url = "https://swupdate.openvpn.org/community/releases/OpenVPN-2.6.12-I001-amd64.msi"
+            tmp_path = os.path.join(tempfile.gettempdir(), "openvpn-setup.msi")
+            try:
+                import urllib.request
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=45) as resp, open(tmp_path, "wb") as f:
+                    f.write(resp.read())
+                _log("[install] Launching OpenVPN installer ...")
+                _toast("Please approve the installer to complete setup.")
+                subprocess.Popen(["msiexec.exe", "/i", tmp_path, "/passive", "/norestart"])
+            except Exception as ex:
+                _log(f"[install] ✗ Failed to install OpenVPN: {ex}")
+                _toast(f"Failed to install OpenVPN: {ex}")
+
+        elif protocol == Protocol.SSLVP:
+            _log("[install] Downloading SoftEther VPN Client from GitHub ...")
+            _toast("Downloading SoftEther installer from GitHub...")
+            url = "https://github.com/SoftEtherVPN/SoftEtherVPN_Stable/releases/download/v4.42-9798-rtm/softether-vpnclient-v4.42-9798-rtm-2023.06.30-windows-x86_x64-intel.exe"
+            tmp_path = os.path.join(tempfile.gettempdir(), "softether-vpnclient-setup.exe")
+            try:
+                import urllib.request
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=90) as resp, open(tmp_path, "wb") as f:
+                    f.write(resp.read())
+                _log("[install] Launching SoftEther setup wizard ...")
+                _toast("Please complete the SoftEther setup wizard.")
+                os.startfile(tmp_path)
+            except Exception as ex:
+                _log(f"[install] ✗ Failed to install SoftEther: {ex}")
+                _toast(f"Failed to install SoftEther: {ex}")
+
+    threading.Thread(target=worker, daemon=True).start()
+

@@ -307,11 +307,21 @@ def protocol_chip(value: str) -> Gtk.Label:
                      css_classes=["chip", _PROTOCOL_CHIP.get(value, "chip-slate")])
 
 
-def ping_chip(ping_ms: int) -> Gtk.Label:
+def ping_chip(ping_ms: int, real_ms: Optional[int] = None) -> Gtk.Label:
     """The colored latency chip used on server cards and in details."""
+    if real_ms is not None:
+        if real_ms < 0:
+            return Gtk.Label(label=_("Offline"), tooltip_text=_("Tested latency: Unreachable (timed out)"),
+                             css_classes=["chip", "chip-ping-slow"])
+        level = ping_level(real_ms)
+        text = f"{real_ms} ms"
+        tip = _("Tested latency: {real} ms (Reported: {rep} ms)").format(
+            real=real_ms, rep=ping_ms) if ping_ms > 0 else f"Tested: {real_ms} ms"
+        return Gtk.Label(label=text, tooltip_text=tip,
+                         css_classes=["chip", _PING_CHIP[level]])
     level = ping_level(ping_ms)
     text = f"{ping_ms} ms" if ping_ms > 0 else "n/a"
-    return Gtk.Label(label=text, tooltip_text=f"Ping: {text}",
+    return Gtk.Label(label=text, tooltip_text=f"Reported ping: {text}",
                      css_classes=["chip", _PING_CHIP[level]])
 
 

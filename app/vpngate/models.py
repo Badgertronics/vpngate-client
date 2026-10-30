@@ -96,6 +96,7 @@ class VpnServer:
     log_policy: str = ""
     operator: str = ""
     score: int = 0
+    real_ping_ms: Optional[int] = None      # Measured latency from client PC in ms (-1 if unreachable)
 
     # Protocol specific bits
     ssl_vpn_port: Optional[int] = None      # SoftEther / SSL-VPN TCP port
@@ -158,6 +159,14 @@ class VpnServer:
         return f"{self.ping_ms} ms" if self.ping_ms else "-"
 
     @property
+    def real_ping_text(self) -> str:
+        if self.real_ping_ms is None:
+            return ""
+        if self.real_ping_ms < 0:
+            return "Unreachable"
+        return f"{self.real_ping_ms} ms"
+
+    @property
     def sessions_text(self) -> str:
         return f"{self.sessions} sessions" if self.sessions else "-"
 
@@ -182,6 +191,7 @@ class VpnServer:
             "operator": self.operator,
             "speed_mbps": self.speed_mbps,
             "ping_ms": self.ping_ms,
+            "real_ping_ms": self.real_ping_ms,
             "score": self.score,
             "ssl_vpn_port": self.ssl_vpn_port,
             "l2tp_supported": self.l2tp_supported,

@@ -370,3 +370,63 @@ def external_ip(timeout: int = 12) -> str:
 
 def which(program: str) -> str:
     return shutil.which(program) or ""
+
+
+def measure_server_latency(server, timeout: float = 1.5) -> int:
+    """Measure real network latency to a VPN server in milliseconds.
+
+    Executes a fast single-packet ICMP echo request, and falls back to a TCP
+    SYN handshake on port 443 / VPN port to bypass ICMP drops or DPI censorship.
+    Returns latency in milliseconds (>= 1), or -1 if unreachable / timed out.
+    """
+    ip = getattr(server, "ip", "") or ""
+    if not ip:
+        return -1
+
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    # 1. Try ICMP ping (fast single packet)
+    try:
+        if sys.platform == "win32":
+            cmd = ["ping", "-n", "1", "-w", str(int(timeout * 1000)), ip]
+        else:
+            cmd = ["ping", "-c", "1", "-W", str(max(1, int(timeout))), ip]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 0.5,
+                             creationflags=creation_flags)
+        if res.returncode == 0:
+            out = res.stdout.lower()
+            m = re.search(r"time[=<]([\d.]+)\s*ms", out)
+            if m:
+                return max(1, int(float(m.group(1))))
+    except Exception:
+        pass
+
+    # 2. Fallback: TCP SYN handshake on port 443 or VPN port
+    ports = []
+    sstp_port = getattr(server, "sstp_port", None)
+    if sstp_port:
+        ports.append(sstp_port)
+    ssl_vpn_port = getattr(server, "ssl_vpn_port", None)
+    if ssl_vpn_port:
+        ports.append(ssl_vpn_port)
+    openvpn_tcp = getattr(server, "openvpn_tcp", None)
+    if openvpn_tcp:
+        ports.append(openvpn_tcp)
+    if 443 not in ports:
+        ports.append(443)
+
+    for p in ports:
+        t0 = time.time()
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            err = s.connect_ex((ip, int(p)))
+            s.close()
+            # 0 means connection accepted; 10061 (Win) or 111 (Linux) means connection
+            # refused, which also confirms the remote host is alive and reachable.
+            if err in (0, 10061, 111):
+                return max(1, int((time.time() - t0) * 1000))
+        except Exception:
+            pass
+
+    return -1
