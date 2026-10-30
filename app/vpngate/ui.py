@@ -112,6 +112,7 @@ class _SheetFallback(Gtk.Box):
 
     def _attach_sheet(self, panel: Gtk.Widget) -> None:
         self._panel = panel
+        panel.set_size_request(-1, 80)
         panel.props.height_request = self._log_height
 
         # Drag handle at the top of the log panel
@@ -140,13 +141,13 @@ class _SheetFallback(Gtk.Box):
 
         def on_drag_update(_g, _ox, oy):
             # Dragging upwards (negative oy) increases panel height
-            max_h = 700
             root = self.get_root()
-            if root is not None and hasattr(root, "get_height"):
-                max_h = max(180, root.get_height() - 100)
+            total_h = root.get_height() if root and hasattr(root, "get_height") else 700
+            # Leave at least 320px for the header bar and splitview content
+            max_h = max(100, min(int(total_h * 0.55), total_h - 320))
             new_h = int(max(80, min(max_h, initial_h[0] - oy)))
             self._log_height = new_h
-            panel.set_size_request(-1, new_h)
+            panel.props.height_request = new_h
 
         def on_drag_end(_g, _ox, _oy):
             root = self.get_root()
@@ -162,6 +163,9 @@ class _SheetFallback(Gtk.Box):
 
         panel.prepend(handle)
         self._revealer.set_child(panel)
+        if self.props.open:
+            self._revealer.set_visible(True)
+            self._revealer.set_reveal_child(True)
 
     def _on_revealer_transition_done(self, revealer, _param) -> None:
         if not revealer.get_child_revealed() and not self.props.open:
@@ -292,6 +296,22 @@ def quick_stack(servers: List[VpnServer], limit: int = 3) -> List[VpnServer]:
     return picks[:limit]
 
 
+def _clean_probe_err(err: Exception | str) -> str:
+    s = str(err).strip()
+    m = re.match(r"^<urlopen error (.*)>$", s)
+    if m:
+        s = m.group(1).strip()
+    elif s.startswith("<") and s.endswith(">"):
+        s = s[1:-1].strip()
+    if "timed out" in s.lower():
+        return "Connection timed out"
+    if "connection refused" in s.lower():
+        return "Connection refused"
+    if "name or service not known" in s.lower() or "nodename nor servname" in s.lower():
+        return "DNS lookup failed"
+    return s
+
+
 def probe_target_detailed(target: str, timeout: float = 3.5) -> tuple[bool, int, str]:
     """Probe a connectivity target and return (is_reachable, rtt_ms, detail_str)."""
     target = (target or "").strip()
@@ -318,10 +338,10 @@ def probe_target_detailed(target: str, timeout: float = 3.5) -> tuple[bool, int,
             return ex.code < 500, ms, f"HTTP {ex.code} {ex.reason}"
         except urllib.error.URLError as ex:
             ms = max(1, int((time.time() - t0) * 1000))
-            return False, ms, str(ex.reason)
+            return False, ms, _clean_probe_err(ex.reason)
         except Exception as ex:
             ms = max(1, int((time.time() - t0) * 1000))
-            return False, ms, str(ex)
+            return False, ms, _clean_probe_err(ex)
 
     # 2. host:port specified
     if ":" in target and not target.startswith("["):
@@ -336,7 +356,7 @@ def probe_target_detailed(target: str, timeout: float = 3.5) -> tuple[bool, int,
             return False, ms, f"TCP connection to port {port} timed out"
         except Exception as ex:
             ms = max(1, int((time.time() - t0) * 1000))
-            return False, ms, str(ex)
+            return False, ms, _clean_probe_err(ex)
 
     # 3. Numeric IPv4 address (e.g. 1.1.1.1, 8.8.8.8)
     if re.match(r"^\d+\.\d+\.\d+\.\d+$", target):
@@ -365,7 +385,7 @@ def probe_target_detailed(target: str, timeout: float = 3.5) -> tuple[bool, int,
         ms = max(1, int((time.time() - t0) * 1000))
         return ex.code < 500, ms, f"HTTPS {ex.code} {ex.reason}"
     except Exception as ex_https:
-        err_msg = str(ex_https)
+        err_msg = _clean_probe_err(ex_https)
         try:
             url = f"http://{target}"
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VPN-Gate-Tester/1.0"})
@@ -377,9 +397,9 @@ def probe_target_detailed(target: str, timeout: float = 3.5) -> tuple[bool, int,
         except urllib.error.HTTPError as ex:
             ms = max(1, int((time.time() - t0) * 1000))
             return ex.code < 500, ms, f"HTTP {ex.code} {ex.reason}"
-        except Exception:
+        except Exception as ex_http:
             ms = max(1, int((time.time() - t0) * 1000))
-            return False, ms, err_msg
+            return False, ms, _clean_probe_err(ex_http) or err_msg
 
 
 def probe_target(target: str, timeout: float = 3.0) -> bool:
@@ -499,11 +519,10 @@ class VpnGateWindow(Adw.ApplicationWindow):
         monitors = disp.get_monitors() if disp else None
         if monitors and monitors.get_n_items() > 0:
             geom = monitors.get_item(0).get_geometry()
-            target_w = max(680, min(1000, int(geom.width * 0.82)))
-            target_h = max(520, min(700, int(geom.height * 0.82)))
-            self.set_default_size(target_w, target_h)
+            self.set_default_size(geom.width, geom.height)
         else:
-            self.set_default_size(880, 620)
+            self.set_default_size(1024, 768)
+        self.maximize()
         # Floor wide enough for content and hero panel
         self.set_size_request(600, 480)
         self.set_icon_name(APP_ID)
@@ -511,6 +530,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._build_ui()
         self._install_breakpoints()
         self._apply_saved_appearance()
+        self._open_sheet()
         self._watch_network()
         GLib.timeout_add_seconds(1, self._tick)
         GLib.idle_add(self._load_cached)
@@ -972,7 +992,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self.toast(_("Log copied to the clipboard"))
 
     def toast(self, message: str, retry: bool = False) -> None:
-        toast = Adw.Toast.new(message)
+        toast = Adw.Toast.new(GLib.markup_escape_text(str(message or "")))
         toast.props.timeout = 6
         if retry:
             toast.props.button_label = _("Retry")
@@ -2058,7 +2078,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
                                 msg = _("{target} is unreachable ({details})").format(target=t, details=details)
                                 self._append_log(_("[connectivity] ✗ Endpoint '{target}' is unreachable ({details})").format(
                                     target=t, details=details))
-                            toast = Adw.Toast.new(msg)
+                            toast = Adw.Toast.new(GLib.markup_escape_text(msg))
                             if dialog is not None and hasattr(dialog, "add_toast"):
                                 dialog.add_toast(toast)
                             else:

@@ -429,6 +429,7 @@ class StatusRing(Gtk.DrawingArea):
         self._loading_frames: List[cairo.ImageSurface] = []
         self._success_surf: Optional[cairo.ImageSurface] = None
         self._failure_surf: Optional[cairo.ImageSurface] = None
+        self._idle_surf: Optional[cairo.ImageSurface] = None
         self.set_draw_func(self._draw, None)
 
     def _ensure_assets(self) -> None:
@@ -463,6 +464,15 @@ class StatusRing(Gtk.DrawingArea):
             except Exception:
                 pass
 
+        # 4. Idle emblem (circular black & white mascot)
+        i_path = (get_icon_path("IDLE.png") or get_icon_path("idle_112.png")
+                  or get_icon_path("idle.png"))
+        if i_path and os.path.isfile(i_path):
+            try:
+                self._idle_surf = cairo.ImageSurface.create_from_png(i_path)
+            except Exception:
+                pass
+
     # -- lifecycle ----------------------------------------------------------
     def set_mode(self, mode: str) -> None:
         if mode == self.mode:
@@ -472,10 +482,12 @@ class StatusRing(Gtk.DrawingArea):
         self._breathe_until = 0.0
         if mode == "connected" and animations_enabled():
             self._breathe_until = self._t0 + 0.7      # one rewarding pulse
-        if self._tick is None and (mode in ("connecting", "authorizing")
-                                   or self._breathe_until):
-            self._tick = self.add_tick_callback(self._on_tick)
-        elif self._tick is not None:
+
+        should_tick = (mode in ("connecting", "authorizing")) or (time.monotonic() < self._breathe_until)
+        if should_tick:
+            if self._tick is None:
+                self._tick = self.add_tick_callback(self._on_tick)
+        else:
             self._stop_tick()
         self.queue_draw()
 
@@ -551,6 +563,18 @@ class StatusRing(Gtk.DrawingArea):
                 cr.set_source_surface(surf, cx - sw / 2, cy - sh / 2)
             cr.paint()
             cr.restore()
+        elif self.mode == "idle" and self._idle_surf:
+            surf = self._idle_surf
+            sw, sh = surf.get_width(), surf.get_height()
+            cr.save()
+            if sw != target_size and sw > 0:
+                scale = target_size / sw
+                cr.scale(scale, scale)
+                cr.set_source_surface(surf, (cx - target_size / 2) / scale, (cy - target_size / 2) / scale)
+            else:
+                cr.set_source_surface(surf, cx - sw / 2, cy - sh / 2)
+            cr.paint()
+            cr.restore()
 
         # Background ring track
         cr.set_source_rgba(*_hex(color, 0.13))
@@ -571,6 +595,8 @@ class StatusRing(Gtk.DrawingArea):
         return False
 
     def _draw_idle(self, cr, cx, cy, r) -> None:
+        if self._idle_surf:
+            return
         # a calm padlock silhouette inside the ring
         cr.set_source_rgba(*_hex("#8a97ac", 0.45))
         cr.set_line_width(2.6)

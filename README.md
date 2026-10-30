@@ -65,7 +65,8 @@ cd vpngate-client
 ## 💡 Quick Tips for the Best Connection 🎯
 
 - 🗾 **Server Recommendations**: Relays located in Japan (🇯🇵) and South Korea (🇰🇷) typically have the highest bandwidth and reliability.
-- 🛡️ **Best Protocol**: We recommend using **SSL-VPN** (default) — it is the most resilient against restrictive firewalls.
+- 🛡️ **Best Protocol**: We recommend using **SSL-VPN** (default) or **MS-SSTP** — they are the most resilient against restrictive firewalls.
+- ⚠️ **Regional Censorship & DPI Notice**: In certain regions and countries with aggressive network filtering (such as **Iran**, China, or Russia), local ISPs and firewalls heavily throttle or completely block specific VPN protocols like **OpenVPN**. If a server fails to connect via OpenVPN in your region, simply switch to **MS-SSTP**, **L2TP/IPsec**, or **SSL-VPN (SoftEther)** using the protocol selector on the right panel! MS-SSTP encapsulates traffic inside standard HTTPS (port 443), making it especially effective at bypassing regional DPI blocks.
 - 🔄 **Stuck on connecting?**: VPN Gate servers are operated by volunteers worldwide. If a server doesn't respond within a few seconds, simply click **Cancel** and select another server!
 
 ---
