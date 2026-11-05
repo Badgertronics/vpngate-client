@@ -2878,7 +2878,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
 
         def task():
             try:
-                info = updater.check_for_updates()
+                info, _err = updater.check_for_updates()
                 if info:
                     GLib.idle_add(lambda: self._prompt_update(info, manual=False))
             except Exception:
@@ -3035,7 +3035,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
                 info = None
                 err = ""
                 try:
-                    info = updater.check_for_updates()
+                    info, err = updater.check_for_updates()
                 except Exception as ex:
                     err = str(ex)
 

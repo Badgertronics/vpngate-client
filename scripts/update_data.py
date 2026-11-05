@@ -103,6 +103,46 @@ def _write_if_changed(path: Path, text: str) -> bool:
     return True
 
 
+def fetch_latest_release_info() -> dict | None:
+    """Fetch metadata for the latest GitHub release."""
+    urls = [
+        "https://api.github.com/repos/Badgertronics/vpngate-client/releases/latest",
+        "https://gh-proxy.com/https://api.github.com/repos/Badgertronics/vpngate-client/releases/latest",
+        "https://ghproxy.net/https://api.github.com/repos/Badgertronics/vpngate-client/releases/latest",
+        "https://ghproxy.cc/https://api.github.com/repos/Badgertronics/vpngate-client/releases/latest",
+    ]
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    for u in urls:
+        try:
+            req = urllib.request.Request(u, headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "application/vnd.github.v3+json,application/json,*/*",
+            })
+            with urllib.request.urlopen(req, timeout=15, context=context) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+                if isinstance(data, dict) and data.get("tag_name"):
+                    return {
+                        "tag_name": data.get("tag_name"),
+                        "name": data.get("name") or data.get("tag_name"),
+                        "body": data.get("body", ""),
+                        "html_url": data.get("html_url", ""),
+                        "published_at": data.get("published_at", ""),
+                        "assets": [
+                            {
+                                "name": a.get("name"),
+                                "browser_download_url": a.get("browser_download_url"),
+                                "size": a.get("size", 0),
+                            }
+                            for a in data.get("assets", [])
+                        ]
+                    }
+        except Exception:
+            continue
+    return None
+
+
 def main() -> int:
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     updated_any = False
@@ -152,6 +192,20 @@ def main() -> int:
         print(f"servers.csv: {len(csv_text):,} bytes, "
               f"{'written' if changed else 'unchanged'}")
         updated_any = updated_any or changed
+
+    # ---- version.json -----------------------------------------------------
+    try:
+        ver_info = fetch_latest_release_info()
+        if ver_info and ver_info.get("tag_name"):
+            changed = _write_if_changed(
+                DATA_DIR / "version.json",
+                json.dumps(ver_info, indent=2) + "\n"
+            )
+            print(f"version.json: {ver_info.get('tag_name')}, "
+                  f"{'written' if changed else 'unchanged'}")
+            updated_any = updated_any or changed
+    except Exception as exc:
+        print(f"!! version.json fetch note: {exc}", file=sys.stderr)
 
     if not fetched_any:
         print("!! nothing could be fetched — leaving the old data alone",

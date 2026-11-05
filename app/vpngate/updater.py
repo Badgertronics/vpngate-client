@@ -11,10 +11,13 @@ import tempfile
 import zipfile
 from typing import Callable, Optional, Tuple
 
-from vpngate.config import VERSION
-from vpngate.netutil import download_file_resilient, download_json_resilient
+from vpngate.config import (GITHUB_REPO, GITHUB_URL, RELEASE_API_MIRRORS,
+                            RELEASE_ASSET_MIRROR_PREFIXES, REPO_VERSION_URLS,
+                            VERSION)
+from vpngate.netutil import (download_file_resilient, download_json_resilient,
+                            download_json_resilient_with_error)
 
-GITHUB_API_LATEST = "https://api.github.com/repos/Badgertronics/vpngate-client/releases/latest"
+GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 
 def parse_version(v: str) -> Tuple[int, ...]:
@@ -73,41 +76,93 @@ def find_matching_asset(assets: list) -> Optional[dict]:
     return None
 
 
-def check_for_updates() -> Optional[dict]:
-    """Check GitHub for a newer release. Returns release metadata if update is available."""
-    data = download_json_resilient(GITHUB_API_LATEST, timeout=15)
-    if not data or not isinstance(data, dict):
-        return None
+def check_for_updates() -> Tuple[Optional[dict], Optional[str]]:
+    """Check for a newer release across GitHub API and mirror proxies/CDNs.
 
-    tag = data.get("tag_name", "").strip()
-    if not tag or not is_newer(tag, VERSION):
-        return None
+    Returns:
+        (info_dict, None) if a newer version is available.
+        (None, None) if check succeeded and local version is already up to date.
+        (None, error_str) if all endpoints failed.
+    """
+    candidate_urls = list(RELEASE_API_MIRRORS) + list(REPO_VERSION_URLS)
+    last_err = "No update sources could be reached"
+    valid_data = None
 
-    assets = data.get("assets", [])
+    for url in candidate_urls:
+        try:
+            data, err = download_json_resilient_with_error(url, timeout=10)
+            if err:
+                last_err = err
+            if data and isinstance(data, dict):
+                tag = (data.get("tag_name") or data.get("version") or "").strip()
+                if tag:
+                    valid_data = data
+                    break
+        except Exception as exc:
+            last_err = str(exc)
+
+    if not valid_data:
+        return None, last_err
+
+    tag = (valid_data.get("tag_name") or valid_data.get("version") or "").strip()
+    if not is_newer(tag, VERSION):
+        # Successfully checked: local version is already the latest!
+        return None, None
+
+    assets = valid_data.get("assets", [])
     matching_asset = find_matching_asset(assets)
 
     return {
         "tag_name": tag,
-        "name": data.get("name") or tag,
-        "body": data.get("body") or "",
-        "html_url": data.get("html_url") or "https://github.com/Badgertronics/vpngate-client/releases/latest",
+        "name": valid_data.get("name") or tag,
+        "body": valid_data.get("body") or "",
+        "html_url": valid_data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/latest",
         "asset": matching_asset,
-    }
+    }, None
 
 
 def download_update_asset(asset_url: str, filename: str,
                           expected_size: int = 0,
                           log_cb: Optional[Callable[[str], None]] = None) -> Optional[str]:
-    """Download update package into a temporary file with live progress logging."""
+    """Download update package into a temporary file with live progress logging and mirror fallbacks."""
     dest_path = os.path.join(tempfile.gettempdir(), filename)
+
+    candidate_urls: List[Tuple[str, str]] = []
+    # 1. Direct download URL
+    candidate_urls.append((asset_url, "GitHub direct"))
+
+    # 2. Add mirror proxies if it's a GitHub URL
+    if "github.com" in asset_url:
+        for prefix in RELEASE_ASSET_MIRROR_PREFIXES:
+            if not prefix:
+                continue
+            mirror_url = f"{prefix.rstrip('/')}/{asset_url}"
+            mirror_label = prefix.split("//")[-1].strip("/")
+            candidate_urls.append((mirror_url, f"mirror {mirror_label}"))
+
+    total_candidates = len(candidate_urls)
+    for idx, (url, label) in enumerate(candidate_urls, 1):
+        if log_cb:
+            if idx == 1:
+                log_cb(f"[update] Downloading {filename} via {label} ...")
+            else:
+                log_cb(f"[update] Retrying download via {label} ({idx}/{total_candidates}) ...")
+
+        try:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+        except Exception:
+            pass
+
+        ok = download_file_resilient(
+            url, dest_path, timeout=180, expected_size=expected_size,
+            log_cb=log_cb, prefix="[update]"
+        )
+        if ok and os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0:
+            return dest_path
+
     if log_cb:
-        log_cb(f"[update] Downloading {filename} ...")
-    ok = download_file_resilient(asset_url, dest_path, timeout=180, expected_size=expected_size,
-                                 log_cb=log_cb, prefix="[update]")
-    if ok and os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0:
-        return dest_path
-    if log_cb:
-        log_cb(f"[update] ✗ Failed to download {filename}")
+        log_cb(f"[update] ✗ Failed to download {filename} across all {total_candidates} sources")
     return None
 
 

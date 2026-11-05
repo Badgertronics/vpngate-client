@@ -573,6 +573,11 @@ def download_file_resilient(url: str, dest_path: str, timeout: int = 180,
                 _log(f"{prefix} ✓ Download completed: {format_size(final_size)} in {format_time(total_elapsed)} (avg {format_size(avg_speed)}/s)")
                 return True
     except Exception as exc:
+        try:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+        except Exception:
+            pass
         _log(f"{prefix} urllib attempt encountered: {exc}, trying curl ...")
 
     # 2. Fallback: native curl binary with live file-size progress monitoring
@@ -587,8 +592,10 @@ def download_file_resilient(url: str, dest_path: str, timeout: int = 180,
         try:
             creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             cmd = [
-                curl_bin, "-L", "-k", "--fail", "--retry", "2",
-                "--connect-timeout", "15", "-m", str(timeout),
+                curl_bin, "-L", "-k", "--fail",
+                "--connect-timeout", "10",
+                "--speed-time", "12", "--speed-limit", "500",
+                "-m", str(timeout),
                 "-o", dest_path, url
             ]
             t0 = time.perf_counter()
@@ -601,9 +608,18 @@ def download_file_resilient(url: str, dest_path: str, timeout: int = 180,
                                     creationflags=creation_flags)
             while proc.poll() is None:
                 time.sleep(0.8)
+                now = time.perf_counter()
+                downloaded = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
+
+                # Detect complete stall at 0 bytes (e.g. domain blocked/blackholed by ISP)
+                if downloaded == 0 and (now - t0) > 12.0:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    break
+
                 if os.path.exists(dest_path):
-                    downloaded = os.path.getsize(dest_path)
-                    now = time.perf_counter()
                     delta_t = now - last_report
                     delta_b = downloaded - last_bytes
                     inst_speed = delta_b / delta_t if delta_t > 0 else 0.0
@@ -622,7 +638,18 @@ def download_file_resilient(url: str, dest_path: str, timeout: int = 180,
                 _log(_format_download_progress(prefix, final_size, total_size or final_size, avg_speed, total_elapsed, 0.0))
                 _log(f"{prefix} ✓ Download completed: {format_size(final_size)} in {format_time(total_elapsed)} (avg {format_size(avg_speed)}/s)")
                 return True
+            else:
+                try:
+                    if os.path.exists(dest_path):
+                        os.remove(dest_path)
+                except Exception:
+                    pass
         except Exception as exc:
+            try:
+                if os.path.exists(dest_path):
+                    os.remove(dest_path)
+            except Exception:
+                pass
             _log(f"{prefix} curl attempt failed: {exc}")
 
     # 3. Windows PowerShell WebClient fallback
@@ -666,45 +693,85 @@ def download_file_resilient(url: str, dest_path: str, timeout: int = 180,
                 _log(_format_download_progress(prefix, final_size, total_size or final_size, avg_speed, total_elapsed, 0.0))
                 _log(f"{prefix} ✓ Download completed: {format_size(final_size)} in {format_time(total_elapsed)} (avg {format_size(avg_speed)}/s)")
                 return True
+            else:
+                try:
+                    if os.path.exists(dest_path):
+                        os.remove(dest_path)
+                except Exception:
+                    pass
         except Exception as exc:
+            try:
+                if os.path.exists(dest_path):
+                    os.remove(dest_path)
+            except Exception:
+                pass
             _log(f"{prefix} powershell attempt failed: {exc}")
 
+    try:
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+    except Exception:
+        pass
     return False
 
 
-def download_json_resilient(url: str, timeout: int = 15) -> Optional[dict]:
-    """Fetch JSON with resilient SSL handling."""
+def download_json_resilient_with_error(url: str, timeout: int = 12) -> Tuple[Optional[dict], Optional[str]]:
+    """Fetch JSON with resilient SSL and detailed error reporting.
+
+    Returns (dict, None) on success, or (None, error_str) on failure.
+    """
     import json
     import ssl
     import urllib.request
+
+    last_err = ""
+    # 1. urllib with unverified SSL
     try:
         req = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "VPN-Gate-Client",
-                "Accept": "application/vnd.github.v3+json"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VPN-Gate-Client",
+                "Accept": "application/vnd.github.v3+json,application/json,*/*"
             }
         )
         ctx = ssl._create_unverified_context()
         with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
             data = resp.read().decode("utf-8", "replace")
-            return json.loads(data)
-    except Exception:
-        # Try curl if python urllib failed
-        curl_candidates = [
-            "curl.exe" if sys.platform == "win32" else "curl",
-            "C:\\Windows\\System32\\curl.exe",
-            shutil.which("curl.exe") if sys.platform == "win32" else shutil.which("curl"),
-        ]
-        curl_bin = next((c for c in curl_candidates if c and (os.path.isfile(c) or shutil.which(c))), None)
-        if curl_bin:
-            try:
-                creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                cmd = [curl_bin, "-s", "-L", "-k", "--connect-timeout", "10", "-m", str(timeout), url]
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2, creationflags=creation_flags)
-                if res.returncode == 0 and res.stdout:
-                    return json.loads(res.stdout)
-            except Exception:
-                pass
-    return None
+            return json.loads(data), None
+    except Exception as exc:
+        last_err = str(exc)
+
+    # 2. curl fallback
+    curl_candidates = [
+        "curl.exe" if sys.platform == "win32" else "curl",
+        "C:\\Windows\\System32\\curl.exe",
+        shutil.which("curl.exe") if sys.platform == "win32" else shutil.which("curl"),
+    ]
+    curl_bin = next((c for c in curl_candidates if c and (os.path.isfile(c) or shutil.which(c))), None)
+    if curl_bin:
+        try:
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            cmd = [
+                curl_bin, "-s", "-L", "-k",
+                "--connect-timeout", "8",
+                "-m", str(timeout),
+                "-H", "Accept: application/vnd.github.v3+json,application/json,*/*",
+                "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) VPN-Gate-Client",
+                url
+            ]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2, creationflags=creation_flags)
+            if res.returncode == 0 and res.stdout and res.stdout.strip().startswith(("{", "[")):
+                return json.loads(res.stdout), None
+            elif res.stderr:
+                last_err = res.stderr.strip()
+        except Exception as exc:
+            last_err = str(exc)
+
+    return None, last_err or "Network request failed"
+
+
+def download_json_resilient(url: str, timeout: int = 15) -> Optional[dict]:
+    """Fetch JSON with resilient SSL handling."""
+    data, _ = download_json_resilient_with_error(url, timeout)
+    return data
 

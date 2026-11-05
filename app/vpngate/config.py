@@ -3,7 +3,7 @@ import sys
 
 APP_NAME = "VPN Gate Client"
 APP_ID = "com.vpngate.client"
-VERSION = "1.0.23"
+VERSION = "1.0.24"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -152,10 +152,28 @@ _REPO_RAW_PREFIXES = [
 
 REPO_MIRROR_LIST_PATH = "data/mirrors.json"
 REPO_CSV_PATH = "data/servers.csv"
+REPO_VERSION_PATH = "data/version.json"
 
 REPO_MIRROR_LIST_URLS = [f"{prefix}/{REPO_MIRROR_LIST_PATH}"
                          for prefix in _REPO_RAW_PREFIXES]
 REPO_CSV_URLS = [f"{prefix}/{REPO_CSV_PATH}" for prefix in _REPO_RAW_PREFIXES]
+REPO_VERSION_URLS = [f"{prefix}/{REPO_VERSION_PATH}" for prefix in _REPO_RAW_PREFIXES]
+
+# Release asset download mirror prefixes (used when direct GitHub downloads fail or are censored)
+RELEASE_ASSET_MIRROR_PREFIXES = [
+    "",  # Direct GitHub download
+    "https://gh-proxy.com/",
+    "https://ghproxy.net/",
+    "https://ghproxy.cc/",
+]
+
+# GitHub release API endpoints and mirror proxies
+RELEASE_API_MIRRORS = [
+    f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+    f"https://gh-proxy.com/https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+    f"https://ghproxy.net/https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+    f"https://ghproxy.cc/https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+]
 
 # ---------------------------------------------------------------------------
 # "Buy me a coffee" — fill in your own wallet addresses here; they are shown
