@@ -3,7 +3,7 @@ import sys
 
 APP_NAME = "VPN Gate Client"
 APP_ID = "com.vpngate.client"
-VERSION = "1.0.22"
+VERSION = "1.0.23"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -107,6 +107,10 @@ DEFAULT_CONNECT_TIMEOUT = 30           # Seconds to wait for a tunnel dial befor
 DEFAULT_CONNECT_RETRIES = 1           # Number of dial attempts before giving up
 DEFAULT_PROBE_TIMEOUT = 3.5           # Timeout in seconds for individual ping/HTTP probes
 DEFAULT_WATCHDOG_INTERVAL = 20        # Interval in seconds between background watchdog probes
+DEFAULT_WATCHDOG_FAILURES = 2         # Consecutive failed checks before disconnecting
+DEFAULT_AUTO_RECONNECT = False        # Automatically reconnect if connection drops unexpectedly
+DEFAULT_AUTO_RECONNECT_RETRIES = 3    # Max auto-reconnect attempts
+DEFAULT_AUTO_RECONNECT_DELAY = 5      # Seconds to wait before auto-reconnecting
 
 # Seconds to wait for a tunnel to come up before giving up (legacy fallback).
 CONNECT_TIMEOUT = 45

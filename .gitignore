@@ -24,3 +24,5 @@ dist_test/
 *.exe
 _internal/
 
+# Others
+others/

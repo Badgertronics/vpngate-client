@@ -41,9 +41,11 @@ from gi.repository import Adw, GLib, Gdk, Gio, Gtk, Pango  # noqa: E402
 from . import fetcher, privilege, updater              # noqa: E402
 from .backends import BACKENDS, install_backend_windows  # noqa: E402
 from .netutil import measure_server_latency           # noqa: E402
-from .config import (APP_NAME, DEFAULT_CONNECT_RETRIES, DEFAULT_CONNECT_TIMEOUT,  # noqa: E402
-                     DEFAULT_CONNECTIVITY_TARGETS, DEFAULT_MIRRORS,
-                     DEFAULT_PROBE_TIMEOUT, DEFAULT_WATCHDOG_INTERVAL,
+from .config import (APP_NAME, DEFAULT_AUTO_RECONNECT, DEFAULT_AUTO_RECONNECT_DELAY,
+                     DEFAULT_AUTO_RECONNECT_RETRIES, DEFAULT_CONNECT_RETRIES,
+                     DEFAULT_CONNECT_TIMEOUT, DEFAULT_CONNECTIVITY_TARGETS,
+                     DEFAULT_MIRRORS, DEFAULT_PROBE_TIMEOUT,
+                     DEFAULT_WATCHDOG_FAILURES, DEFAULT_WATCHDOG_INTERVAL,
                      DEVELOPER_NAME, DONATE_BEP20, DONATE_BITCOIN,
                      DONATE_ETHEREUM, GITHUB_URL, STATE_DIR, VERSION)
 from .models import PROTOCOL_ORDER, Protocol, VpnServer  # noqa: E402
@@ -556,6 +558,15 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self.settings.get("connectivity_targets")
             or list(DEFAULT_CONNECTIVITY_TARGETS)
         )
+        self.connectivity_target_states: Dict[str, bool] = dict(
+            self.settings.get("connectivity_target_states") or {}
+        )
+        self._known_pings: Dict[str, int] = {}
+        self._last_connected_server: Optional[VpnServer] = None
+        self._last_connected_protocol: Optional[Protocol] = None
+        self._manual_disconnect = False
+        self._auto_reconnect_attempt = 0
+        self._auto_reconnect_timer_id: Optional[int] = None
         self._watchdog_in_flight = False
         self._watchdog_last_check = 0.0
         self._watchdog_failures = 0
@@ -890,6 +901,10 @@ class VpnGateWindow(Adw.ApplicationWindow):
         def worker():
             ms = measure_server_latency(server, timeout=1.0)
             server.real_ping_ms = ms
+            if server.ip:
+                self._known_pings[server.ip] = ms
+            if server.hostname:
+                self._known_pings[server.hostname] = ms
 
             def deliver():
                 if ms >= 0:
@@ -952,6 +967,10 @@ class VpnGateWindow(Adw.ApplicationWindow):
                     except Exception:
                         ms = -1
                     s.real_ping_ms = ms
+                    if s.ip:
+                        self._known_pings[s.ip] = ms
+                    if s.hostname:
+                        self._known_pings[s.hostname] = ms
                     completed += 1
                     host_str = s.hostname or s.ip
                     if ms >= 0:
@@ -1285,6 +1304,13 @@ class VpnGateWindow(Adw.ApplicationWindow):
 
             def deliver() -> bool:
                 if servers:
+                    for s in servers:
+                        ms = getattr(s, "real_ping_ms", None)
+                        if ms is not None:
+                            if s.ip:
+                                self._known_pings[s.ip] = ms
+                            if s.hostname:
+                                self._known_pings[s.hostname] = ms
                     self.set_servers(servers, source=_("the daily cache"))
                 self.act_refresh()
                 return False
@@ -1384,6 +1410,20 @@ class VpnGateWindow(Adw.ApplicationWindow):
                 count=len(servers), time=time.strftime("%H:%M"))
 
     def set_servers(self, servers: List[VpnServer], source: str = "") -> None:
+        known = getattr(self, "_known_pings", {})
+        for s in servers:
+            ms = getattr(s, "real_ping_ms", None)
+            if ms is None:
+                stored = known.get(s.ip) if s.ip else None
+                if stored is None and s.hostname:
+                    stored = known.get(s.hostname)
+                if stored is not None:
+                    s.real_ping_ms = stored
+            else:
+                if s.ip:
+                    known[s.ip] = ms
+                if s.hostname:
+                    known[s.hostname] = ms
         self.servers = list(servers)
         self._save_cache(servers)
         if source:
@@ -1529,7 +1569,13 @@ class VpnGateWindow(Adw.ApplicationWindow):
         right.append(speed_box)
 
         ping_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6, halign=Gtk.Align.END)
-        real_c = real_ping_chip(getattr(server, "real_ping_ms", None))
+        row_real_ms = getattr(server, "real_ping_ms", None)
+        if row_real_ms is None:
+            known = getattr(self, "_known_pings", {})
+            row_real_ms = (known.get(server.ip) if server.ip else None) or (known.get(server.hostname) if server.hostname else None)
+            if row_real_ms is not None:
+                server.real_ping_ms = row_real_ms
+        real_c = real_ping_chip(row_real_ms)
         row._real_ping_chip = real_c
         ping_box.append(real_c)
 
@@ -1570,6 +1616,11 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self.details_host.set_text("{}\nIP {}\nISP {}".format(
             host, server.ip or "—", server.isp_hostname or "—"))
         real_ms = getattr(server, "real_ping_ms", None)
+        if real_ms is None:
+            known = getattr(self, "_known_pings", {})
+            real_ms = (known.get(server.ip) if server.ip else None) or (known.get(server.hostname) if server.hostname else None)
+            if real_ms is not None:
+                server.real_ping_ms = real_ms
         if real_ms is None:
             real_ping_str = _("Not tested yet (click Ping)")
         elif real_ms < 0:
@@ -1694,6 +1745,9 @@ class VpnGateWindow(Adw.ApplicationWindow):
                 self._prompt_missing_backend_windows(server, protocol)
                 return
 
+        self._last_connected_server = server
+        self._last_connected_protocol = protocol
+        self._manual_disconnect = False
         self._aborting = False
         self._hide_chips()
         timeout = int(self.settings.get("connect_timeout", DEFAULT_CONNECT_TIMEOUT))
@@ -1714,6 +1768,9 @@ class VpnGateWindow(Adw.ApplicationWindow):
         """Stop pressed while dialing/authorizing: return to the idle view immediately."""
         if self.state not in ("connecting", "authorizing"):
             return
+        self._manual_disconnect = True
+        self._auto_reconnect_attempt = 0
+        self._cancel_auto_reconnect()
         self._aborting = True
         self._pending = None
         self._append_log(_("Stop pressed — aborting the connection attempt"))
@@ -1987,7 +2044,8 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self._append_log(_("ERROR: {detail}").format(detail=message))
             if self._aborting:
                 pass                         # stopping already; wait for it
-            elif self.state == "connecting":
+            elif self.state in ("connecting", "connected"):
+                was_connected = (self.state == "connected")
                 self.hero_ring.set_mode("error")
                 self.hero_title.set_label(_("Connection failed"))
                 self.hero_sub.set_text(_("Connection failed. Check log for details."))
@@ -1997,6 +2055,8 @@ class VpnGateWindow(Adw.ApplicationWindow):
                 if len(toast_msg) > 60:
                     toast_msg = toast_msg[:57] + "…"
                 self.toast(toast_msg)
+                if was_connected and not getattr(self, "_manual_disconnect", False) and bool(self.settings.get("auto_reconnect", DEFAULT_AUTO_RECONNECT)):
+                    self._schedule_auto_reconnect()
         if kind == "bye":
             self._close_everything()
         return False
@@ -2030,6 +2090,8 @@ class VpnGateWindow(Adw.ApplicationWindow):
         elif state == "disconnected":
             stopped = self._aborting
             self._aborting = False
+            manual = getattr(self, "_manual_disconnect", False)
+            self._manual_disconnect = False
             if stopped:
                 self.state = "idle"
                 self.hero_ring.set_mode("idle")
@@ -2047,8 +2109,12 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self._last_connectivity_log_time = 0.0
             self._hide_chips()
             self._update_buttons()
+            if not stopped and not manual and bool(self.settings.get("auto_reconnect", DEFAULT_AUTO_RECONNECT)):
+                self._schedule_auto_reconnect()
 
     def _handle_connected(self, info: dict) -> None:
+        self._auto_reconnect_attempt = 0
+        self._cancel_auto_reconnect()
         self._has_logged_first_probe = False
         self._watchdog_failures = 0
         self._last_connectivity_log_time = 0.0
@@ -2091,11 +2157,15 @@ class VpnGateWindow(Adw.ApplicationWindow):
         return True
 
     def _run_watchdog_probe(self) -> None:
-        targets = list(self.connectivity_targets)
+        targets = [t for t in self.connectivity_targets if self.connectivity_target_states.get(t, True)]
+        if not targets:
+            self._watchdog_in_flight = False
+            return
         success = False
         reached_target = None
         rtt_ms = 0
         probe_timeout = float(self.settings.get("probe_timeout", DEFAULT_PROBE_TIMEOUT))
+        threshold = int(self.settings.get("watchdog_threshold", DEFAULT_WATCHDOG_FAILURES))
         for target in targets:
             t0 = time.time()
             if probe_target(target, timeout=probe_timeout):
@@ -2131,11 +2201,12 @@ class VpnGateWindow(Adw.ApplicationWindow):
                     self._last_connectivity_log_time = now
                     self._append_log(_("[connectivity] Initial check warning: {targets} did not respond").format(targets=targets_str))
                 else:
-                    self._append_log(_("[connectivity] Check warning: {targets} unreachable (attempt {attempt}/2)").format(targets=targets_str, attempt=self._watchdog_failures))
+                    self._append_log(_("[connectivity] Check warning: {targets} unreachable (attempt {attempt}/{threshold})").format(
+                        targets=targets_str, attempt=self._watchdog_failures, threshold=threshold))
 
-                if self._watchdog_failures >= 2:
+                if self._watchdog_failures >= threshold:
                     self._watchdog_failures = 0
-                    self._append_log(_("[connectivity] ERROR: Connection lost — active connectivity check failed (targets unreachable)"))
+                    self._append_log(_("[connectivity] ERROR: Connection lost — active connectivity check failed ({threshold}/{threshold} attempts failed)").format(threshold=threshold))
                     self.toast(_("Connection lost: Internet or tunnel connection dropped."))
                     self.hero_ring.set_mode("error")
                     self.hero_title.set_label(_("Connection lost"))
@@ -2146,6 +2217,64 @@ class VpnGateWindow(Adw.ApplicationWindow):
             return False
 
         GLib.idle_add(on_probe_done)
+
+    def _schedule_auto_reconnect(self) -> None:
+        if not bool(self.settings.get("auto_reconnect", DEFAULT_AUTO_RECONNECT)):
+            return
+        if self._aborting or getattr(self, "_manual_disconnect", False):
+            return
+
+        server = getattr(self, "_last_connected_server", None) or self.selected or self.recommended
+        protocol = getattr(self, "_last_connected_protocol", None)
+        if server is None:
+            return
+        if protocol is None:
+            target_proto = Protocol.SSTP if sys.platform == "win32" else Protocol.SSLVP
+            protocol = target_proto if server.supports(target_proto) else (server.protocols[0] if server.protocols else target_proto)
+
+        max_attempts = int(self.settings.get("auto_reconnect_retries", DEFAULT_AUTO_RECONNECT_RETRIES))
+        delay = int(self.settings.get("auto_reconnect_delay", DEFAULT_AUTO_RECONNECT_DELAY))
+        attempts = getattr(self, "_auto_reconnect_attempt", 0) + 1
+
+        if attempts > max_attempts:
+            self._append_log(_("[auto-reconnect] Maximum reconnection attempts ({max_attempts}) reached. Stopping auto-reconnect.").format(
+                max_attempts=max_attempts))
+            self.toast(_("Auto-reconnect stopped: max attempts reached"))
+            self._auto_reconnect_attempt = 0
+            return
+
+        self._auto_reconnect_attempt = attempts
+        self._cancel_auto_reconnect()
+
+        host = server.hostname or server.ip
+        self._append_log(_("[auto-reconnect] Disconnection detected. Auto-reconnecting to {host} via {proto} in {delay}s (attempt {attempt}/{max_attempts}) ...").format(
+            host=host, proto=protocol_name(protocol.value), delay=delay, attempt=attempts, max_attempts=max_attempts))
+        self.toast(_("Reconnecting to {host} in {delay}s ({attempt}/{max})").format(
+            host=host, delay=delay, attempt=attempts, max=max_attempts))
+
+        self.hero_ring.set_mode("connecting")
+        self.hero_title.set_label(_("Reconnecting…"))
+        self.hero_sub.set_text(_("Auto-reconnecting in {delay}s …").format(delay=delay))
+
+        def do_reconnect() -> bool:
+            self._auto_reconnect_timer_id = None
+            if self._aborting or getattr(self, "_manual_disconnect", False) or self.state == "connected":
+                return False
+            self._append_log(_("[auto-reconnect] Initiating reconnect attempt {attempt}/{max_attempts} to {host} ...").format(
+                attempt=attempts, max_attempts=max_attempts, host=host))
+            self._connect(server, protocol)
+            return False
+
+        self._auto_reconnect_timer_id = GLib.timeout_add_seconds(delay, do_reconnect)
+
+    def _cancel_auto_reconnect(self) -> None:
+        timer_id = getattr(self, "_auto_reconnect_timer_id", None)
+        if timer_id is not None:
+            try:
+                GLib.source_remove(timer_id)
+            except Exception:
+                pass
+            self._auto_reconnect_timer_id = None
 
     # -- button state ------------------------------------------------------
     def _set_state(self, state: str, message: Optional[str]) -> None:
@@ -2348,12 +2477,70 @@ class VpnGateWindow(Adw.ApplicationWindow):
         row_interval.connect("notify::value", on_interval_changed)
         group.add(row_interval)
 
+        current_threshold = float(self.settings.get("watchdog_threshold", DEFAULT_WATCHDOG_FAILURES))
+        row_threshold = _make_spin_row(
+            _("Watchdog failure threshold (attempts)"),
+            _("Disconnect the tunnel if active probes fail this many consecutive rounds"),
+            1.0, 10.0, 1.0, current_threshold, digits=0)
+
+        def on_threshold_changed(row, _param) -> None:
+            self.settings["watchdog_threshold"] = int(row.get_value())
+            save_settings(self.settings)
+
+        row_threshold.connect("notify::value", on_threshold_changed)
+        group.add(row_threshold)
+
         page.add(group)
+
+        reconnect_group = Adw.PreferencesGroup(
+            title=_("Automatic Reconnection"),
+            description=_("Automatically restore connection if the tunnel drops unexpectedly."))
+
+        current_auto = bool(self.settings.get("auto_reconnect", DEFAULT_AUTO_RECONNECT))
+        row_auto = Adw.SwitchRow(
+            title=_("Auto-reconnect on disconnect"),
+            subtitle=_("Dial back into the relay if connection is lost"))
+        row_auto.set_active(current_auto)
+
+        def on_auto_changed(row, _param) -> None:
+            self.settings["auto_reconnect"] = bool(row.get_active())
+            save_settings(self.settings)
+
+        row_auto.connect("notify::active", on_auto_changed)
+        reconnect_group.add(row_auto)
+
+        current_auto_retries = float(self.settings.get("auto_reconnect_retries", DEFAULT_AUTO_RECONNECT_RETRIES))
+        row_auto_retries = _make_spin_row(
+            _("Max reconnection attempts"),
+            _("Number of times to attempt reconnecting before giving up"),
+            1.0, 10.0, 1.0, current_auto_retries, digits=0)
+
+        def on_auto_retries_changed(row, _param) -> None:
+            self.settings["auto_reconnect_retries"] = int(row.get_value())
+            save_settings(self.settings)
+
+        row_auto_retries.connect("notify::value", on_auto_retries_changed)
+        reconnect_group.add(row_auto_retries)
+
+        current_auto_delay = float(self.settings.get("auto_reconnect_delay", DEFAULT_AUTO_RECONNECT_DELAY))
+        row_auto_delay = _make_spin_row(
+            _("Reconnection delay (seconds)"),
+            _("Time to wait before initiating automatic reconnection"),
+            1.0, 30.0, 1.0, current_auto_delay, digits=0)
+
+        def on_auto_delay_changed(row, _param) -> None:
+            self.settings["auto_reconnect_delay"] = int(row.get_value())
+            save_settings(self.settings)
+
+        row_auto_delay.connect("notify::value", on_auto_delay_changed)
+        reconnect_group.add(row_auto_delay)
+
+        page.add(reconnect_group)
 
         reset_group = Adw.PreferencesGroup()
         reset_row = Adw.ActionRow(
-            title=_("Reset timeouts"),
-            subtitle=_("Restore default timeouts and retry counts"))
+            title=_("Reset timeouts and retries"),
+            subtitle=_("Restore default timeouts, probe thresholds, and reconnect parameters"))
         reset_btn = Gtk.Button(label=_("Reset to defaults"),
                                css_classes=["flat", "destructive"],
                                valign=Gtk.Align.CENTER)
@@ -2363,11 +2550,19 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self.settings["connect_retries"] = DEFAULT_CONNECT_RETRIES
             self.settings["probe_timeout"] = DEFAULT_PROBE_TIMEOUT
             self.settings["watchdog_interval"] = DEFAULT_WATCHDOG_INTERVAL
+            self.settings["watchdog_threshold"] = DEFAULT_WATCHDOG_FAILURES
+            self.settings["auto_reconnect"] = DEFAULT_AUTO_RECONNECT
+            self.settings["auto_reconnect_retries"] = DEFAULT_AUTO_RECONNECT_RETRIES
+            self.settings["auto_reconnect_delay"] = DEFAULT_AUTO_RECONNECT_DELAY
             save_settings(self.settings)
             row_timeout.set_value(DEFAULT_CONNECT_TIMEOUT)
             row_retries.set_value(DEFAULT_CONNECT_RETRIES)
             row_probe.set_value(DEFAULT_PROBE_TIMEOUT)
             row_interval.set_value(DEFAULT_WATCHDOG_INTERVAL)
+            row_threshold.set_value(DEFAULT_WATCHDOG_FAILURES)
+            row_auto.set_active(DEFAULT_AUTO_RECONNECT)
+            row_auto_retries.set_value(DEFAULT_AUTO_RECONNECT_RETRIES)
+            row_auto_delay.set_value(DEFAULT_AUTO_RECONNECT_DELAY)
             toast = Adw.Toast.new(_("Default timeouts and retries restored"))
             if dialog is not None and hasattr(dialog, "add_toast"):
                 dialog.add_toast(toast)
@@ -2449,10 +2644,12 @@ class VpnGateWindow(Adw.ApplicationWindow):
 
     def _persist_targets(self) -> None:
         self.settings["connectivity_targets"] = list(self.connectivity_targets)
+        self.settings["connectivity_target_states"] = dict(self.connectivity_target_states)
         save_settings(self.settings)
 
     def _reset_targets(self, dialog: Optional[Adw.PreferencesDialog] = None) -> None:
         self.connectivity_targets = list(DEFAULT_CONNECTIVITY_TARGETS)
+        self.connectivity_target_states = {t: True for t in DEFAULT_CONNECTIVITY_TARGETS}
         self._persist_targets()
         self._fill_target_rows(dialog)
         toast = Adw.Toast.new(_("Default test endpoints restored"))
@@ -2475,7 +2672,23 @@ class VpnGateWindow(Adw.ApplicationWindow):
         group._target_rows = []
 
         for target in list(self.connectivity_targets):
+            is_enabled = self.connectivity_target_states.get(target, True)
             row = Adw.ActionRow(title=target)
+            row.set_subtitle(_("Enabled — probed during active connection") if is_enabled else _("Disabled — skipped during probes"))
+
+            switch = Gtk.Switch(active=is_enabled, valign=Gtk.Align.CENTER)
+            switch.set_tooltip_text(_("Enable or disable this test endpoint"))
+
+            def make_toggle_handler(t: str, action_row: Adw.ActionRow):
+                def on_notify_active(sw, _param):
+                    active = sw.get_active()
+                    self.connectivity_target_states[t] = active
+                    self._persist_targets()
+                    action_row.set_subtitle(_("Enabled — probed during active connection") if active else _("Disabled — skipped during probes"))
+                return on_notify_active
+
+            switch.connect("notify::active", make_toggle_handler(target, row))
+            row.add_prefix(switch)
 
             test_btn = Gtk.Button(label=_("Test"),
                                   css_classes=["flat"],
@@ -3043,10 +3256,15 @@ class VpnGateWindow(Adw.ApplicationWindow):
     def _disconnect(self) -> None:
         if self.state != "connected":
             return
+        self._manual_disconnect = True
+        self._auto_reconnect_attempt = 0
+        self._cancel_auto_reconnect()
         self._append_log(_("Disconnecting the tunnel …"))
         self._send({"cmd": "disconnect"})
 
     def _quit(self) -> None:
+        self._manual_disconnect = True
+        self._cancel_auto_reconnect()
         self._send({"cmd": "quit"})
         if self.tray is not None:
             self.tray.stop()
