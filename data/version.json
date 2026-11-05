@@ -1,34 +1,39 @@
 {
   "tag_name": "v1.0.25",
   "name": "VPN Gate Client v1.0.25",
+  "body": "**Full Changelog**: https://github.com/Badgertronics/vpngate-client/compare/v1.0.24...v1.0.25",
   "html_url": "https://github.com/Badgertronics/vpngate-client/releases/tag/v1.0.25",
-  "body": "VPN Gate Client v1.0.25 release: automatic reuse of pre-downloaded packages in user's Downloads directory and SHA-256 hash integrity verification.",
-  "published_at": "2026-11-05T11:00:00Z",
+  "published_at": "2026-11-05T11:25:52Z",
   "assets": [
     {
-      "name": "vpngate-client-v1.0.25-windows-x86_64.zip",
-      "browser_download_url": "https://github.com/Badgertronics/vpngate-client/releases/download/v1.0.25/vpngate-client-v1.0.25-windows-x86_64.zip",
-      "size": 53873561
-    },
-    {
-      "name": "vpngate-client_1.0.25_amd64.deb",
-      "browser_download_url": "https://github.com/Badgertronics/vpngate-client/releases/download/v1.0.25/vpngate-client_1.0.25_amd64.deb",
-      "size": 39000000
-    },
-    {
-      "name": "vpngate-client-v1.0.25-linux-x86_64.tar.gz",
-      "browser_download_url": "https://github.com/Badgertronics/vpngate-client/releases/download/v1.0.25/vpngate-client-v1.0.25-linux-x86_64.tar.gz",
-      "size": 52000000
-    },
-    {
-      "name": "vpngate-client_1.0.25_arm64.deb",
-      "browser_download_url": "https://github.com/Badgertronics/vpngate-client/releases/download/v1.0.25/vpngate-client_1.0.25_arm64.deb",
-      "size": 40000000
+      "name": "SHA256SUMS.txt",
+      "browser_download_url": "https://github.com/Badgertronics/vpngate-client/releases/download/v1.0.25/SHA256SUMS.txt",
+      "size": 521
     },
     {
       "name": "vpngate-client-v1.0.25-linux-arm64.tar.gz",
       "browser_download_url": "https://github.com/Badgertronics/vpngate-client/releases/download/v1.0.25/vpngate-client-v1.0.25-linux-arm64.tar.gz",
-      "size": 54000000
+      "size": 53790414
+    },
+    {
+      "name": "vpngate-client-v1.0.25-linux-x86_64.tar.gz",
+      "browser_download_url": "https://github.com/Badgertronics/vpngate-client/releases/download/v1.0.25/vpngate-client-v1.0.25-linux-x86_64.tar.gz",
+      "size": 52123960
+    },
+    {
+      "name": "vpngate-client-v1.0.25-windows-x86_64.zip",
+      "browser_download_url": "https://github.com/Badgertronics/vpngate-client/releases/download/v1.0.25/vpngate-client-v1.0.25-windows-x86_64.zip",
+      "size": 53884444
+    },
+    {
+      "name": "vpngate-client_1.0.25_amd64.deb",
+      "browser_download_url": "https://github.com/Badgertronics/vpngate-client/releases/download/v1.0.25/vpngate-client_1.0.25_amd64.deb",
+      "size": 38733174
+    },
+    {
+      "name": "vpngate-client_1.0.25_arm64.deb",
+      "browser_download_url": "https://github.com/Badgertronics/vpngate-client/releases/download/v1.0.25/vpngate-client_1.0.25_arm64.deb",
+      "size": 39934502
     }
   ]
 }
