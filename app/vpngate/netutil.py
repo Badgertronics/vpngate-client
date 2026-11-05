@@ -570,7 +570,7 @@ def download_file_resilient(url: str, dest_path: str, timeout: int = 180,
                 total_elapsed = max(0.001, time.perf_counter() - t0)
                 avg_speed = final_size / total_elapsed
                 _log(_format_download_progress(prefix, final_size, total_size or final_size, avg_speed, total_elapsed, 0.0))
-                _log(f"{prefix} ✓ Download completed: {format_size(final_size)} in {format_time(total_elapsed)} (avg {format_size(avg_speed)}/s)")
+                _log(f"{prefix} [ok] Download completed: {format_size(final_size)} in {format_time(total_elapsed)} (avg {format_size(avg_speed)}/s)")
                 return True
     except Exception as exc:
         try:
@@ -636,7 +636,7 @@ def download_file_resilient(url: str, dest_path: str, timeout: int = 180,
                 total_elapsed = max(0.001, time.perf_counter() - t0)
                 avg_speed = final_size / total_elapsed
                 _log(_format_download_progress(prefix, final_size, total_size or final_size, avg_speed, total_elapsed, 0.0))
-                _log(f"{prefix} ✓ Download completed: {format_size(final_size)} in {format_time(total_elapsed)} (avg {format_size(avg_speed)}/s)")
+                _log(f"{prefix} [ok] Download completed: {format_size(final_size)} in {format_time(total_elapsed)} (avg {format_size(avg_speed)}/s)")
                 return True
             else:
                 try:
@@ -691,7 +691,7 @@ def download_file_resilient(url: str, dest_path: str, timeout: int = 180,
                 total_elapsed = max(0.001, time.perf_counter() - t0)
                 avg_speed = final_size / total_elapsed
                 _log(_format_download_progress(prefix, final_size, total_size or final_size, avg_speed, total_elapsed, 0.0))
-                _log(f"{prefix} ✓ Download completed: {format_size(final_size)} in {format_time(total_elapsed)} (avg {format_size(avg_speed)}/s)")
+                _log(f"{prefix} [ok] Download completed: {format_size(final_size)} in {format_time(total_elapsed)} (avg {format_size(avg_speed)}/s)")
                 return True
             else:
                 try:
@@ -774,4 +774,47 @@ def download_json_resilient(url: str, timeout: int = 15) -> Optional[dict]:
     """Fetch JSON with resilient SSL handling."""
     data, _ = download_json_resilient_with_error(url, timeout)
     return data
+
+
+def fetch_text_resilient(url: str, timeout: int = 10) -> str:
+    """Fetch small text file (e.g. SHA256SUMS.txt) with resilient SSL and mirror fallbacks."""
+    import ssl
+    import urllib.request
+
+    candidate_urls = [url]
+    if "github.com" in url:
+        for prefix in ("https://gh-proxy.com/", "https://ghproxy.net/", "https://ghproxy.cc/"):
+            candidate_urls.append(f"{prefix.rstrip('/')}/{url}")
+
+    for u in candidate_urls:
+        try:
+            req = urllib.request.Request(
+                u,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VPN-Gate-Client"}
+            )
+            ctx = ssl._create_unverified_context()
+            with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", "replace")
+        except Exception:
+            continue
+
+    # Fallback to curl
+    curl_candidates = [
+        "curl.exe" if sys.platform == "win32" else "curl",
+        "C:\\Windows\\System32\\curl.exe",
+        shutil.which("curl.exe") if sys.platform == "win32" else shutil.which("curl"),
+    ]
+    curl_bin = next((c for c in curl_candidates if c and (os.path.isfile(c) or shutil.which(c))), None)
+    if curl_bin:
+        for u in candidate_urls:
+            try:
+                creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                cmd = [curl_bin, "-s", "-L", "-k", "--connect-timeout", "6", "-m", str(timeout), u]
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 2, creationflags=creation_flags)
+                if res.returncode == 0 and res.stdout:
+                    return res.stdout
+            except Exception:
+                continue
+
+    return ""
 

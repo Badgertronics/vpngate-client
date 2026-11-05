@@ -2940,6 +2940,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
             dest = updater.download_update_asset(
                 asset["url"], filename,
                 expected_size=int(asset.get("size") or 0),
+                expected_sha256=str(asset.get("sha256") or ""),
                 log_cb=lambda msg: GLib.idle_add(self._append_log, msg)
             )
             if not dest or not os.path.isfile(dest):

@@ -1,12 +1,14 @@
 """GitHub release update checker and installer for VPN Gate Client."""
 from __future__ import annotations
 
+import hashlib
 import os
 import platform
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import zipfile
 from typing import Callable, Optional, Tuple
@@ -15,7 +17,8 @@ from vpngate.config import (GITHUB_REPO, GITHUB_URL, RELEASE_API_MIRRORS,
                             RELEASE_ASSET_MIRROR_PREFIXES, REPO_VERSION_URLS,
                             VERSION)
 from vpngate.netutil import (download_file_resilient, download_json_resilient,
-                            download_json_resilient_with_error)
+                            download_json_resilient_with_error,
+                            fetch_text_resilient)
 
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -29,6 +32,140 @@ def parse_version(v: str) -> Tuple[int, ...]:
 def is_newer(remote_tag: str, local_ver: str) -> bool:
     """Return True if remote_tag is strictly newer than local_ver."""
     return parse_version(remote_tag) > parse_version(local_ver)
+
+
+def compute_sha256(filepath: str) -> str:
+    """Compute SHA-256 hex digest of a local file."""
+    h = hashlib.sha256()
+    try:
+        with open(filepath, "rb") as f:
+            while chunk := f.read(65536):
+                h.update(chunk)
+        return h.hexdigest().lower()
+    except Exception:
+        return ""
+
+
+def verify_file_integrity(filepath: str, expected_size: int = 0,
+                          expected_sha256: str = "") -> bool:
+    """Verify local file matches expected SHA-256 and/or size & archive validity."""
+    if not os.path.isfile(filepath):
+        return False
+
+    try:
+        actual_size = os.path.getsize(filepath)
+    except OSError:
+        return False
+
+    if actual_size <= 0:
+        return False
+
+    # 1. Authoritative SHA-256 checksum check if available
+    if expected_sha256:
+        actual_sha = compute_sha256(filepath)
+        if actual_sha and actual_sha.lower() == expected_sha256.lower().strip():
+            return True
+        return False
+
+    # 2. Exact size check if size is known (> 0)
+    if expected_size > 0 and actual_size != expected_size:
+        return False
+
+    # 3. Archive integrity validation
+    lower_path = filepath.lower()
+    if lower_path.endswith(".zip"):
+        try:
+            with zipfile.ZipFile(filepath, "r") as zf:
+                if zf.testzip() is not None:
+                    return False
+            return True
+        except Exception:
+            return False
+    elif lower_path.endswith((".tar.gz", ".tgz")):
+        try:
+            with tarfile.open(filepath, "r:gz") as tf:
+                if not tf.getmembers():
+                    return False
+            return True
+        except Exception:
+            return False
+    elif lower_path.endswith(".deb"):
+        try:
+            with open(filepath, "rb") as f:
+                magic = f.read(8)
+                if not magic.startswith(b"!<arch>"):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    return actual_size > 0
+
+
+def get_download_directories() -> list[str]:
+    """Return ordered list of standard user download and cache directories."""
+    dirs: list[str] = []
+
+    # 1. User Downloads folder
+    if sys.platform == "win32":
+        try:
+            import winreg
+            sub_key = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub_key) as key:
+                val, _ = winreg.QueryValueEx(key, "{374DE290-123F-4565-9164-39C4925E467B}")
+                if val and os.path.isdir(val) and val not in dirs:
+                    dirs.append(val)
+        except Exception:
+            pass
+
+    home_dl = os.path.join(os.path.expanduser("~"), "Downloads")
+    if os.path.isdir(home_dl) and home_dl not in dirs:
+        dirs.append(home_dl)
+
+    # 2. System Temp directory
+    temp_dir = tempfile.gettempdir()
+    if os.path.isdir(temp_dir) and temp_dir not in dirs:
+        dirs.append(temp_dir)
+
+    # 3. Dedicated vpngate cache directory
+    vpngate_temp = os.path.join(temp_dir, "vpngate_updates")
+    if os.path.isdir(vpngate_temp) and vpngate_temp not in dirs:
+        dirs.append(vpngate_temp)
+
+    return dirs
+
+
+def find_existing_update_asset(filename: str, expected_size: int = 0,
+                               expected_sha256: str = "",
+                               log_cb: Optional[Callable[[str], None]] = None) -> Optional[str]:
+    """Search user download and temp directories for an existing valid update file."""
+    if not filename:
+        return None
+
+    base, ext = os.path.splitext(filename)
+    candidates = [
+        filename,
+        f"{base} (1){ext}",
+        f"{base} (2){ext}",
+        f"{base} (3){ext}",
+    ]
+
+    for d in get_download_directories():
+        for pat in candidates:
+            candidate_path = os.path.join(d, pat)
+            if os.path.isfile(candidate_path):
+                if verify_file_integrity(candidate_path, expected_size, expected_sha256):
+                    if log_cb:
+                        if expected_sha256:
+                            log_cb(f"[update] [found] Existing valid package in {d}: {pat} (SHA-256 matched)")
+                        else:
+                            log_cb(f"[update] [found] Existing valid package in {d}: {pat} (size and archive verified)")
+                    return candidate_path
+                else:
+                    if log_cb and os.path.getsize(candidate_path) > 0:
+                        log_cb(f"[update] Found existing file in {d}: {pat}, but checksum/size did not match — skipping")
+
+    return None
 
 
 def find_matching_asset(assets: list) -> Optional[dict]:
@@ -45,6 +182,7 @@ def find_matching_asset(assets: list) -> Optional[dict]:
                     "name": a["name"],
                     "url": a.get("browser_download_url"),
                     "size": a.get("size", 0),
+                    "sha256": a.get("sha256") or a.get("hash") or "",
                 }
         return None
 
@@ -61,6 +199,7 @@ def find_matching_asset(assets: list) -> Optional[dict]:
                     "name": a["name"],
                     "url": a.get("browser_download_url"),
                     "size": a.get("size", 0),
+                    "sha256": a.get("sha256") or a.get("hash") or "",
                 }
 
         # 2. Fall back to .tar.gz bundle
@@ -71,6 +210,7 @@ def find_matching_asset(assets: list) -> Optional[dict]:
                     "name": a["name"],
                     "url": a.get("browser_download_url"),
                     "size": a.get("size", 0),
+                    "sha256": a.get("sha256") or a.get("hash") or "",
                 }
 
     return None
@@ -112,6 +252,26 @@ def check_for_updates() -> Tuple[Optional[dict], Optional[str]]:
     assets = valid_data.get("assets", [])
     matching_asset = find_matching_asset(assets)
 
+    # If matching_asset lacks sha256, attempt to fetch SHA256SUMS.txt from release assets
+    if matching_asset and not matching_asset.get("sha256"):
+        checksum_asset = next(
+            (a for a in assets if "sha256" in a.get("name", "").lower() or "checksum" in a.get("name", "").lower()),
+            None
+        )
+        if checksum_asset and checksum_asset.get("browser_download_url"):
+            try:
+                txt = fetch_text_resilient(checksum_asset["browser_download_url"], timeout=8)
+                if txt:
+                    for line in txt.splitlines():
+                        parts = line.strip().split()
+                        if len(parts) >= 2 and len(parts[0]) == 64:
+                            f_name = os.path.basename(parts[1].lstrip("*"))
+                            if f_name.lower() == matching_asset["name"].lower():
+                                matching_asset["sha256"] = parts[0].lower()
+                                break
+            except Exception:
+                pass
+
     return {
         "tag_name": tag,
         "name": valid_data.get("name") or tag,
@@ -123,8 +283,18 @@ def check_for_updates() -> Tuple[Optional[dict], Optional[str]]:
 
 def download_update_asset(asset_url: str, filename: str,
                           expected_size: int = 0,
+                          expected_sha256: str = "",
                           log_cb: Optional[Callable[[str], None]] = None) -> Optional[str]:
-    """Download update package into a temporary file with live progress logging and mirror fallbacks."""
+    """Obtain update package: reuses verified existing local download if present, or downloads it."""
+    # 1. Search for existing valid download in user's Downloads or Temp directories
+    existing = find_existing_update_asset(
+        filename, expected_size=expected_size, expected_sha256=expected_sha256, log_cb=log_cb
+    )
+    if existing:
+        if log_cb:
+            log_cb(f"[update] Using verified existing package: {existing}")
+        return existing
+
     dest_path = os.path.join(tempfile.gettempdir(), filename)
 
     candidate_urls: List[Tuple[str, str]] = []
@@ -159,10 +329,18 @@ def download_update_asset(asset_url: str, filename: str,
             log_cb=log_cb, prefix="[update]"
         )
         if ok and os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0:
-            return dest_path
+            if verify_file_integrity(dest_path, expected_size, expected_sha256):
+                return dest_path
+            else:
+                if log_cb:
+                    log_cb(f"[update] [failed] Integrity check failed for download from {label}")
+                try:
+                    os.remove(dest_path)
+                except Exception:
+                    pass
 
     if log_cb:
-        log_cb(f"[update] ✗ Failed to download {filename} across all {total_candidates} sources")
+        log_cb(f"[update] [failed] Failed to download {filename} across all {total_candidates} sources")
     return None
 
 
@@ -187,6 +365,18 @@ def apply_windows_update(zip_path: str, app_dir: str, current_pid: int) -> bool:
     script_path = os.path.join(tempfile.gettempdir(), "vpngate_update_runner.ps1")
     exe_target = os.path.join(app_dir, "vpngate-gui.exe")
 
+    # Only remove zip_path if it was inside the temporary directory (never delete user Downloads)
+    is_temp_zip = False
+    try:
+        norm_zip = os.path.normcase(os.path.abspath(zip_path))
+        norm_temp = os.path.normcase(os.path.abspath(tempfile.gettempdir()))
+        if norm_zip.startswith(norm_temp):
+            is_temp_zip = True
+    except Exception:
+        pass
+
+    remove_zip_cmd = f'Remove-Item -Path "{zip_path}" -Force' if is_temp_zip else "# Preserving user download package"
+
     ps_content = f"""# VPN Gate Client Self-Updater
 $ErrorActionPreference = 'SilentlyContinue'
 $procId = {current_pid}
@@ -204,7 +394,7 @@ Start-Process -FilePath "$exeTarget"
 
 Start-Sleep -Seconds 2
 Remove-Item -Path "{extract_dir}" -Recurse -Force
-Remove-Item -Path "{zip_path}" -Force
+{remove_zip_cmd}
 Remove-Item -Path $MyInvocation.MyCommand.Path -Force
 """
     try:

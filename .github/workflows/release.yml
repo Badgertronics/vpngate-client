@@ -117,6 +117,13 @@ jobs:
       - name: Display downloaded artifacts
         run: ls -lh release_assets/
 
+      - name: Generate SHA256 checksums
+        run: |
+          cd release_assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cd ..
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
