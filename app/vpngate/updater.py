@@ -364,6 +364,7 @@ def apply_windows_update(zip_path: str, app_dir: str, current_pid: int) -> bool:
 
     script_path = os.path.join(tempfile.gettempdir(), "vpngate_update_runner.ps1")
     exe_target = os.path.join(app_dir, "vpngate-gui.exe")
+    log_file = os.path.join(tempfile.gettempdir(), "vpngate_update.log")
 
     # Only remove zip_path if it was inside the temporary directory (never delete user Downloads)
     is_temp_zip = False
@@ -375,27 +376,66 @@ def apply_windows_update(zip_path: str, app_dir: str, current_pid: int) -> bool:
     except Exception:
         pass
 
-    remove_zip_cmd = f'Remove-Item -Path "{zip_path}" -Force' if is_temp_zip else "# Preserving user download package"
+    remove_zip_cmd = f'Remove-Item -LiteralPath "{zip_path}" -Force -ErrorAction SilentlyContinue' if is_temp_zip else "# Preserving user download package"
 
     ps_content = f"""# VPN Gate Client Self-Updater
-$ErrorActionPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Continue'
 $procId = {current_pid}
 $appDir = "{app_dir}"
 $srcDir = "{src_folder}"
 $exeTarget = "{exe_target}"
+$logPath = "{log_file}"
 
-try {{
-    Wait-Process -Id $procId -Timeout 15
-}} catch {{}}
+function Log($msg) {{
+    $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    "[$timestamp] $msg" | Out-File -LiteralPath $logPath -Append -Encoding utf8
+}}
+
+Log "Updater script started for PID $procId"
+
+# 1. Wait up to 5 seconds for the main GUI process to exit, then terminate it forcefully
+$waited = 0
+while ($waited -lt 10) {{
+    if (-not (Get-Process -Id $procId -ErrorAction SilentlyContinue)) {{
+        break
+    }}
+    Start-Sleep -Milliseconds 500
+    $waited++
+}}
+Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+
+# 2. Also ensure all background worker/helper processes are killed so no files are locked
+Get-Process | Where-Object {{ $_.ProcessName -like "vpngate*" }} | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 1
 
-Copy-Item -Path "$srcDir\\*" -Destination "$appDir" -Recurse -Force
-Start-Process -FilePath "$exeTarget"
+# 3. Copy new files with retry loop in case file locks take a moment to release
+$copyOk = $false
+for ($attempt = 1; $attempt -le 6; $attempt++) {{
+    try {{
+        Log "Copying files from $srcDir to $appDir (Attempt $attempt)..."
+        Copy-Item -Path "$srcDir\\*" -Destination "$appDir" -Recurse -Force -ErrorAction Stop
+        $copyOk = $true
+        Log "File copy succeeded on attempt $attempt."
+        break
+    }} catch {{
+        Log "Copy attempt $attempt failed: $_"
+        Start-Sleep -Seconds 1
+    }}
+}}
 
+# 4. Restart application from target directory
+if ($copyOk -and (Test-Path -LiteralPath "$exeTarget")) {{
+    Log "Starting $exeTarget..."
+    Start-Process -FilePath "$exeTarget" -WorkingDirectory "$appDir"
+}} else {{
+    Log "ERROR: Copy failed or exeTarget does not exist."
+}}
+
+# 5. Clean up temporary extract folder
 Start-Sleep -Seconds 2
-Remove-Item -Path "{extract_dir}" -Recurse -Force
+Remove-Item -LiteralPath "{extract_dir}" -Recurse -Force -ErrorAction SilentlyContinue
 {remove_zip_cmd}
-Remove-Item -Path $MyInvocation.MyCommand.Path -Force
+Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
 """
     try:
         with open(script_path, "w", encoding="utf-8") as f:
@@ -404,14 +444,25 @@ Remove-Item -Path $MyInvocation.MyCommand.Path -Force
         print(f"[updater] Failed to write updater script: {exc}", file=sys.stderr)
         return False
 
-    creation_flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | \
-                     getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    creation_flags = 0
+    if sys.platform == "win32":
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
     try:
         subprocess.Popen(
-            ["powershell.exe", "-ExecutionPolicy", "Bypass", "-NoProfile", "-WindowStyle", "Hidden", "-File", script_path],
+            [
+                "powershell.exe",
+                "-ExecutionPolicy", "Bypass",
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle", "Hidden",
+                "-File", script_path,
+            ],
             creationflags=creation_flags,
-            close_fds=True
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
         )
         return True
     except Exception as exc:

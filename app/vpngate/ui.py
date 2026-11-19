@@ -2917,8 +2917,15 @@ class VpnGateWindow(Adw.ApplicationWindow):
 
         msg = _("A new version of VPN Gate Client is available.")
         if body:
-            lines = [line.strip() for line in body.splitlines() if line.strip()][:6]
-            msg += "\n\n" + "\n".join(lines)
+            seen_lines = set()
+            lines = []
+            for line in body.splitlines():
+                s = line.strip()
+                if s and s not in seen_lines:
+                    seen_lines.add(s)
+                    lines.append(s)
+            if lines:
+                msg += "\n\n" + "\n".join(lines[:6])
 
         if not asset:
             msg += "\n\n" + _("Please download the package from GitHub.")
@@ -2979,7 +2986,14 @@ class VpnGateWindow(Adw.ApplicationWindow):
                     if ok:
                         GLib.idle_add(lambda: self.toast(_("Restarting for update...")))
                         time.sleep(0.5)
-                        GLib.idle_add(self._quit)
+                        try:
+                            if self.worker is not None and hasattr(self.worker, "kill"):
+                                self.worker.kill()
+                            if hasattr(self, "tray") and self.tray is not None and getattr(self.tray, "_proc", None):
+                                self.tray._proc.kill()
+                        except Exception:
+                            pass
+                        os._exit(0)
                     else:
                         GLib.idle_add(self._append_log, _("[update] ✗ Failed to launch updater script"))
                         GLib.idle_add(lambda: self.toast(_("Failed to apply update")))
