@@ -25,7 +25,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .config import (REPO_CSV_URLS, REPO_MIRROR_LIST_URLS,  # noqa: E402
                      USER_AGENT)
-from .models import VpnServer
+from .models import VpnServer, normalize_country
 
 # ---------------------------------------------------------------------------
 # Low level helpers
@@ -110,13 +110,18 @@ def _server_tables(document: str) -> List[str]:
 
 
 def _parse_country(cell: str) -> Tuple[str, str]:
-    flag = re.search(r"flags/([A-Za-z0-9_\-]+)\.png", cell)
+    flag = re.search(r"flags/([A-Za-z0-9_\-]+)\.(?:png|gif|svg|jpg)", cell, re.I)
     code = ""
     if flag:
         code = flag.group(1).split("/")[-1].upper()
     name = _text(cell)
-    if code and name.upper().startswith(code):
-        name = name[len(code):].strip()
+    if code:
+        m = re.match(r"^" + re.escape(code) + r"[\s\-_:/]+(.*)$", name, re.I)
+        if m:
+            name = m.group(1).strip()
+        elif name.strip().upper() == code:
+            name = ""
+    name, code = normalize_country(name, code)
     return name, code
 
 
@@ -413,7 +418,12 @@ def merge_openvpn_configs(servers: List[VpnServer],
             extra = csv_map.get(short)
         if not extra:
             continue
-        server.openvpn_config_b64 = extra.openvpn_config_b64
+        if not server.openvpn_config_b64 and extra.openvpn_config_b64:
+            server.openvpn_config_b64 = extra.openvpn_config_b64
+        if not server.country and extra.country:
+            server.country = extra.country
+        if not server.country_code and extra.country_code:
+            server.country_code = extra.country_code
         if not server.ping_ms:
             server.ping_ms = extra.ping_ms
         if not server.speed_mbps:
@@ -471,60 +481,56 @@ def fetch_from_mirror(mirror: str, want_csv: bool = True
 
 
 def fetch_servers(mirrors: List[str]) -> Tuple[List[VpnServer], str]:
-    """Collect the relay table through a chain of increasingly robust sources.
+    """Collect the relay table through a chain of robust sources.
 
-    1. The fresh mirror list published in this project's own repository
-       (``data/mirrors.json``, refreshed daily by the scheduled GitHub
-       Action) — those mirrors are tried first.
-    2. The mirrors compiled into the app / configured by the user.
-    3. ``data/servers.csv`` from the project repository (the raw
-       ``/api/iphone/`` CSV, fetched via raw.githubusercontent.com and its
-       jsDelivr CDN copies).
-    4. The hourly ``vpngate-list-mirror`` CSV snapshots on the jsDelivr
-       CDN (third-party safety net).
+    1. Direct GitHub servers.csv (and CDN/proxy mirrors): fast single-request
+       fetch containing the latest ~100 servers with OpenVPN profiles.
+       (Preferred source as requested).
+    2. Mirror sites: live VPNGate mirrors from data/mirrors.json and user settings.
+    3. Fallback CSV: hourly snapshots from jsDelivr CDN as safety net.
     """
     errors = []
+
+    # Priority 1: GitHub / CDN / Proxy servers.csv directly (fast, robust, full configs)
+    try:
+        csv_text, source = fetch_repo_csv()
+        servers = servers_from_csv(csv_text)
+        if servers:
+            return servers, f"GitHub servers.csv via {source}"
+    except Exception as exc:                      # noqa: BLE001
+        errors.append(f"repository servers.csv: {exc}")
+
+    # Priority 2: Live VPNGate mirror sites (HTML + CSV)
     candidates = list(mirrors)
     try:
         repo_mirrors, repo_url = fetch_repo_mirrors()
-    except FetchError:
-        pass
-    except Exception as exc:                      # noqa: BLE001
-        errors.append(f"repository mirror list: {exc}")
-    else:
         merged = [m for m in mirrors if m not in repo_mirrors]
         candidates = repo_mirrors + merged
+    except Exception as exc:                      # noqa: BLE001
+        errors.append(f"repository mirror list: {exc}")
 
     for mirror in candidates:
         try:
             servers, _ = fetch_from_mirror(mirror)
+            if servers:
+                return servers, mirror
         except FetchError as exc:
             errors.append(str(exc))
             continue
         except Exception as exc:                  # noqa: BLE001
             errors.append(f"{mirror}: {exc}")
             continue
-        if servers:
-            return servers, mirror
-    # Every mirror was unreachable: use the committed CSV from the project
-    # repository, then the hourly CDN snapshot as the very last resort.
-    try:
-        csv_text, source = fetch_repo_csv()
-        servers = servers_from_csv(csv_text)
-    except Exception as exc:                      # noqa: BLE001
-        errors.append(f"repository servers.csv: {exc}")
-    else:
-        if servers:
-            return servers, f"GitHub servers.csv via {source}"
+
+    # Priority 3: Third-party hourly CSV snapshot on jsDelivr CDN
     try:
         csv_text, source = fetch_fallback_csv()
         servers = servers_from_csv(csv_text)
-    except Exception as exc:                      # noqa: BLE001
-        errors.append(f"csv snapshot: {exc}")
-    else:
         if servers:
             return servers, f"csv snapshot via {source}"
-    raise FetchError("Could not reach any VPN Gate mirror:\n  " +
+    except Exception as exc:                      # noqa: BLE001
+        errors.append(f"csv snapshot: {exc}")
+
+    raise FetchError("Could not reach any VPN Gate data source:\n  " +
                      "\n  ".join(errors))
 
 

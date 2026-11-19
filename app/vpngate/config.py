@@ -3,7 +3,7 @@ import sys
 
 APP_NAME = "VPN Gate Client"
 APP_ID = "com.vpngate.client"
-VERSION = "1.0.25"
+VERSION = "1.0.26"
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -148,6 +148,9 @@ _REPO_RAW_PREFIXES = [
     f"https://fastly.jsdelivr.net/gh/{GITHUB_REPO}@{REPO_BRANCH}",
     f"https://gcore.jsdelivr.net/gh/{GITHUB_REPO}@{REPO_BRANCH}",
     f"https://testingcf.jsdelivr.net/gh/{GITHUB_REPO}@{REPO_BRANCH}",
+    f"https://gh-proxy.com/https://raw.githubusercontent.com/{GITHUB_REPO}/{REPO_BRANCH}",
+    f"https://ghproxy.net/https://raw.githubusercontent.com/{GITHUB_REPO}/{REPO_BRANCH}",
+    f"https://ghproxy.cc/https://raw.githubusercontent.com/{GITHUB_REPO}/{REPO_BRANCH}",
 ]
 
 REPO_MIRROR_LIST_PATH = "data/mirrors.json"

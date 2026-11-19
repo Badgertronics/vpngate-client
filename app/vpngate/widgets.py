@@ -63,6 +63,21 @@ CSS_BASE = """
     font-weight: 800;
     letter-spacing: 0.05em;
 }
+.flag-icon {
+    border-radius: 4px;
+}
+
+/* ---- preferences dialog & view switcher --------------------------------- */
+viewswitcherbar button,
+viewswitcher button {
+    padding-left: 6px;
+    padding-right: 6px;
+}
+viewswitcherbar button label,
+viewswitcher button label {
+    font-size: 86%;
+    font-weight: 600;
+}
 .error-hint {
     color: #ef4444;
     font-size: 88%;
@@ -219,6 +234,8 @@ def get_flag_svg_path(code: str) -> str:
         os.path.join(os.path.dirname(sys.executable), "icons", "flags", f"{code}.svg"),
         os.path.join(getattr(sys, "_MEIPASS", ""), "icons", "flags", f"{code}.svg"),
         os.path.join(os.path.dirname(sys.executable), "_internal", "icons", "flags", f"{code}.svg"),
+        os.path.join("/usr/lib/vpngate-client", "icons", "flags", f"{code}.svg"),
+        os.path.join("/usr/share/vpngate-client", "icons", "flags", f"{code}.svg"),
     ]
     for p in candidates:
         if p and os.path.isfile(p):
@@ -262,7 +279,15 @@ def flag_text(code: str) -> str:
 
 
 def flag_widget(code: str, size: int = 20) -> Gtk.Widget:
-    """Return a country flag emoji label widget."""
+    """Return a country flag widget (SVG image if available, fallback to emoji label)."""
+    svg_path = get_flag_svg_path(code)
+    if svg_path:
+        img = Gtk.Image.new_from_file(svg_path)
+        img.set_pixel_size(size)
+        img.set_valign(Gtk.Align.CENTER)
+        img.set_halign(Gtk.Align.CENTER)
+        img.add_css_class("flag-icon")
+        return img
     emoji = flag_text(code)
     lbl = Gtk.Label(label=emoji, css_classes=["flag"], valign=Gtk.Align.CENTER)
     if size >= 24:

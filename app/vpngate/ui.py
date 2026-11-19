@@ -260,6 +260,7 @@ def _server_from_dict(item: dict) -> VpnServer:
     for key, value in (item or {}).items():
         if hasattr(server, key):
             setattr(server, key, value)
+    server.__post_init__()
     return server
 
 
@@ -2343,6 +2344,25 @@ class VpnGateWindow(Adw.ApplicationWindow):
     def act_settings(self) -> None:
         dialog = Adw.PreferencesDialog()
         dialog.props.title = _("Settings")
+        if hasattr(dialog, "set_content_width"):
+            dialog.set_content_width(900)
+        if hasattr(dialog, "set_content_height"):
+            dialog.set_content_height(640)
+        if hasattr(dialog.props, "content_width"):
+            try:
+                dialog.props.content_width = 900
+            except Exception:
+                pass
+        if hasattr(dialog.props, "content_height"):
+            try:
+                dialog.props.content_height = 640
+            except Exception:
+                pass
+        if hasattr(dialog, "set_default_size"):
+            try:
+                dialog.set_default_size(900, 640)
+            except Exception:
+                pass
         dialog.add(self._appearance_page())
         dialog.add(self._timeouts_page(dialog))
         dialog.add(self._connectivity_page(dialog))
