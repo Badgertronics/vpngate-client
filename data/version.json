@@ -3,7 +3,7 @@
   "name": "VPN Gate Client v1.0.27",
   "body": "**Full Changelog**: https://github.com/Badgertronics/vpngate-client/compare/v1.0.26...v1.0.27",
   "html_url": "https://github.com/Badgertronics/vpngate-client/releases/tag/v1.0.27",
-  "published_at": "2026-11-19T14:30:00Z",
+  "published_at": "2026-11-19T11:58:49Z",
   "assets": [
     {
       "name": "SHA256SUMS.txt",
@@ -13,27 +13,27 @@
     {
       "name": "vpngate-client-v1.0.27-linux-arm64.tar.gz",
       "browser_download_url": "https://github.com/Badgertronics/vpngate-client/releases/download/v1.0.27/vpngate-client-v1.0.27-linux-arm64.tar.gz",
-      "size": 53790414
+      "size": 53798229
     },
     {
       "name": "vpngate-client-v1.0.27-linux-x86_64.tar.gz",
       "browser_download_url": "https://github.com/Badgertronics/vpngate-client/releases/download/v1.0.27/vpngate-client-v1.0.27-linux-x86_64.tar.gz",
-      "size": 52123960
+      "size": 52139032
     },
     {
       "name": "vpngate-client-v1.0.27-windows-x86_64.zip",
       "browser_download_url": "https://github.com/Badgertronics/vpngate-client/releases/download/v1.0.27/vpngate-client-v1.0.27-windows-x86_64.zip",
-      "size": 53884444
+      "size": 54095426
     },
     {
       "name": "vpngate-client_1.0.27_amd64.deb",
       "browser_download_url": "https://github.com/Badgertronics/vpngate-client/releases/download/v1.0.27/vpngate-client_1.0.27_amd64.deb",
-      "size": 38733174
+      "size": 38743944
     },
     {
       "name": "vpngate-client_1.0.27_arm64.deb",
       "browser_download_url": "https://github.com/Badgertronics/vpngate-client/releases/download/v1.0.27/vpngate-client_1.0.27_arm64.deb",
-      "size": 39934502
+      "size": 39942860
     }
   ]
 }
