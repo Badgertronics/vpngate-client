@@ -1,5 +1,7 @@
 <p align="center">
   <img src="app/icons/hicolor/scalable/apps/com.vpngate.client.png" alt="VPN Gate Client Logo" width="160" height="160">
+
+  ![demo](demo/demo.gif)
 </p>
 
 # 🛡️ VPN Gate Client 🚀
