@@ -405,7 +405,16 @@ while ($waited -lt 10) {{
 Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
 
 # 2. Also ensure all background worker/helper processes are killed so no files are locked
-Get-Process | Where-Object {{ $_.ProcessName -like "vpngate*" }} | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process | Where-Object {{ $_.ProcessName -match '^(vpngate|gdbus|openvpn)' }} | Stop-Process -Force -ErrorAction SilentlyContinue
+
+# Terminate any process originating from $appDir
+Get-Process | ForEach-Object {{
+    try {{
+        if ($_.Path -and ($_.Path.StartsWith($appDir, [System.StringComparison]::OrdinalIgnoreCase))) {{
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+        }}
+    }} catch {{}}
+}}
 Start-Sleep -Seconds 1
 
 # 3. Copy new files with retry loop in case file locks take a moment to release
@@ -413,12 +422,37 @@ $copyOk = $false
 for ($attempt = 1; $attempt -le 6; $attempt++) {{
     try {{
         Log "Copying files from $srcDir to $appDir (Attempt $attempt)..."
+        $robocopy = (Get-Command "robocopy.exe" -ErrorAction SilentlyContinue)
+        if ($robocopy) {{
+            & $robocopy.Source "$srcDir" "$appDir" /E /R:3 /W:1 /NP /NFL /NDL | Out-Null
+            if ($LASTEXITCODE -lt 8) {{
+                $copyOk = $true
+                Log "File copy via robocopy succeeded on attempt $attempt (exit code $LASTEXITCODE)."
+                break
+            }} else {{
+                Log "robocopy exited with code $LASTEXITCODE, falling back to Copy-Item..."
+            }}
+        }}
         Copy-Item -Path "$srcDir\\*" -Destination "$appDir" -Recurse -Force -ErrorAction Stop
         $copyOk = $true
-        Log "File copy succeeded on attempt $attempt."
+        Log "File copy via Copy-Item succeeded on attempt $attempt."
         break
     }} catch {{
         Log "Copy attempt $attempt failed: $_"
+        if ($_.Exception.Message -match "denied|unauthorized" -and $attempt -eq 1) {{
+            Log "Access denied detected. Attempting elevated copy via UAC..."
+            try {{
+                $elevatedArgs = "-NoProfile -ExecutionPolicy Bypass -Command `"robocopy '$srcDir' '$appDir' /E /R:3 /W:1 /NP /NFL /NDL; if (`$LASTEXITCODE -lt 8) {{{{ exit 0 }}}} else {{{{ Copy-Item -Path '$srcDir\\*' -Destination '$appDir' -Recurse -Force }}}}`""
+                $proc = Start-Process -FilePath "powershell.exe" -ArgumentList $elevatedArgs -Verb RunAs -Wait -PassThru
+                if ($proc.ExitCode -eq 0) {{
+                    $copyOk = $true
+                    Log "Elevated copy succeeded."
+                    break
+                }}
+            }} catch {{
+                Log "Elevation request failed or cancelled: $_"
+            }}
+        }}
         Start-Sleep -Seconds 1
     }}
 }}

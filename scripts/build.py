@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_DIR = ROOT / "app" if (ROOT / "app").exists() else ROOT
+
+def sync_version(version_str: str) -> None:
+    config_file = APP_DIR / "vpngate" / "config.py"
+    if config_file.is_file():
+        content = config_file.read_text(encoding="utf-8")
+        new_content = re.sub(r'VERSION\s*=\s*["\'][^"\']+["\']', f'VERSION = "{version_str}"', content)
+        if new_content != content:
+            config_file.write_text(new_content, encoding="utf-8")
+            print(f"==> Synced VERSION in {config_file} to: {version_str}")
 
 # Extract version from app/vpngate/config.py
 sys.path.insert(0, str(APP_DIR))
@@ -331,8 +341,16 @@ def package_deb(source_dir: Path, output_deb: Path, deb_arch: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build and package VPN Gate Client")
     parser.add_argument("--deb", action="store_true", help="Build .deb package on Linux")
+    parser.add_argument("--version", default=None, help="Explicit release version string (e.g. 1.0.29)")
     parser.add_argument("--output-dir", default="dist_release", help="Release directory")
     args = parser.parse_args()
+
+    global VERSION
+    target_ver = args.version or os.environ.get("RELEASE_TAG") or os.environ.get("GITHUB_REF_NAME")
+    if target_ver:
+        target_ver = re.sub(r"^[vV]", "", target_ver.strip())
+        sync_version(target_ver)
+        VERSION = target_ver
 
     os_name, arch, deb_arch = get_platform_info()
     out_dir = ROOT / args.output_dir

@@ -53,7 +53,7 @@ jobs:
 
       - name: Build standalone bundle, tarball, and Debian package
         run: |
-          python3 scripts/build.py --deb --output-dir dist_release
+          python3 scripts/build.py --version "${{ github.ref_name || inputs.tag_name || '1.0.29' }}" --deb --output-dir dist_release
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
@@ -107,7 +107,7 @@ jobs:
         run: |
           export GI_TYPELIB_PATH=/ucrt64/lib/girepository-1.0:$GI_TYPELIB_PATH
           python -m pip install --upgrade pip pyinstaller
-          python scripts/build.py --output-dir dist_release
+          python scripts/build.py --version "${{ github.ref_name || inputs.tag_name || '1.0.29' }}" --output-dir dist_release
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
