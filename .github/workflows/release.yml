@@ -4,12 +4,15 @@ on:
   push:
     tags:
       - "v*"
+      - "V*"
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]*"
   workflow_dispatch:
     inputs:
       tag_name:
-        description: "Release tag name (e.g. v1.0.0)"
+        description: "Release tag name (e.g. v1.0.28 or 1.0.28)"
         required: false
-        default: "v1.0.0"
+        default: "v1.0.28"
 
 permissions:
   contents: write
@@ -68,21 +71,35 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup MSYS2 with GTK4 and Libadwaita
+      - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
-          update: true
-          install: >-
-            git
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-python
-            mingw-w64-ucrt-x86_64-python-pip
-            mingw-w64-ucrt-x86_64-python-gobject
-            mingw-w64-ucrt-x86_64-python-cairo
-            mingw-w64-ucrt-x86_64-gtk4
-            mingw-w64-ucrt-x86_64-libadwaita
-            mingw-w64-ucrt-x86_64-graphene
+          update: false
+
+      - name: Configure reliable MSYS2 mirrors and install build dependencies
+        shell: msys2 {0}
+        run: |
+          # Remove broken/unreachable mirrors (such as mirror.selfnet.de returning 500)
+          for ml in /etc/pacman.d/mirrorlist*; do
+            sed -i '/selfnet/d' "$ml" || true
+          done
+          
+          # Enable curl download retries in pacman
+          sed -i 's|^#XferCommand = /usr/bin/curl|XferCommand = /usr/bin/curl -k -C - -f -y 30 -Y 1000 --retry 5 --retry-delay 3 -o %o %u|g' /etc/pacman.conf || true
+          
+          # Synchronize databases and install required packages
+          pacman -Sy --noconfirm --disable-download-timeout
+          pacman -S --needed --noconfirm --disable-download-timeout \
+            git \
+            mingw-w64-ucrt-x86_64-gcc \
+            mingw-w64-ucrt-x86_64-python \
+            mingw-w64-ucrt-x86_64-python-pip \
+            mingw-w64-ucrt-x86_64-python-gobject \
+            mingw-w64-ucrt-x86_64-python-cairo \
+            mingw-w64-ucrt-x86_64-gtk4 \
+            mingw-w64-ucrt-x86_64-libadwaita \
+            mingw-w64-ucrt-x86_64-graphene \
             mingw-w64-ucrt-x86_64-gdk-pixbuf2
 
       - name: Build Windows release bundle in MSYS2
@@ -127,8 +144,8 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || (inputs.tag_name || 'v1.0.0') }}
-          name: "VPN Gate Client ${{ github.ref_type == 'tag' && github.ref_name || (inputs.tag_name || 'v1.0.0') }}"
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || (inputs.tag_name || 'v1.0.28') }}
+          name: "VPN Gate Client ${{ github.ref_type == 'tag' && github.ref_name || (inputs.tag_name || 'v1.0.28') }}"
           files: release_assets/*
           generate_release_notes: true
           draft: false
