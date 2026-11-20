@@ -304,14 +304,43 @@ COUNTRY_NAMES: dict[str, str] = {
 }
 
 
+_COUNTRY_NAME_ALIASES: dict[str, tuple[str, str]] = {
+    "hrvatska": ("Croatia", "HR"),
+    "republika hrvatska": ("Croatia", "HR"),
+    "croatia": ("Croatia", "HR"),
+    "croatia (local name hrvatska)": ("Croatia", "HR"),
+    "belarus": ("Belarus", "BY"),
+    "byelorus": ("Belarus", "BY"),
+    "byelorussia": ("Belarus", "BY"),
+    "republic of belarus": ("Belarus", "BY"),
+    "thailand": ("Thailand", "TH"),
+    "ailand": ("Thailand", "TH"),
+    "hailand": ("Thailand", "TH"),
+    "india": ("India", "IN"),
+    "ndia": ("India", "IN"),
+    "dia": ("India", "IN"),
+    "iran": ("Iran", "IR"),
+    "ran": ("Iran", "IR"),
+    "taiwan": ("Taiwan", "TW"),
+    "aiwan": ("Taiwan", "TW"),
+}
+
+
 def normalize_country(country: str, country_code: str) -> tuple[str, str]:
     """Clean and normalize country name and two-letter country code."""
     code = (country_code or "").strip().upper()
     name = (country or "").strip()
 
+    low = name.lower()
+    if low in _COUNTRY_NAME_ALIASES:
+        c_name, c_code = _COUNTRY_NAME_ALIASES[low]
+        return c_name, code or c_code
+
     canonical = COUNTRY_NAMES.get(code)
     if canonical:
         if not name or name.upper() == code:
+            name = canonical
+        elif code in ("HR", "BY", "TH", "IN", "IR", "TW", "VN", "KR", "RU", "US", "GB", "JP"):
             name = canonical
         elif canonical.lower().endswith(name.lower()):
             # Handle corrupted names where the first letters were sliced off

@@ -685,9 +685,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self.banners = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.offline_banner = self._banner(_("No network connection"))
         self.fallback_banner = self._banner(
-            _("All mirror sites were unreachable — using a snapshot from "
-              "the project repository or the CDN (a little older, but "
-              "usable)."))
+            _("Using servers snapshot from the project repository."))
         self.auth_banner = self._banner(
             _("Administrator privileges are required to start the helper."),
             button_label=_("Retry"))
@@ -1402,9 +1400,12 @@ class VpnGateWindow(Adw.ApplicationWindow):
             else:
                 self.list_stack.set_visible_child_name("error")
             return
-        # Live-mirror fetches report their URL; repository/CDN snapshots do
-        # not start with "http" and deserve the "a little older" banner.
-        self.fallback_banner.props.revealed = not (source or "").startswith("http")
+        if (source or "").startswith("http"):
+            self.fallback_banner.props.title = _("Using live mirror sites.")
+            self.fallback_banner.props.revealed = False
+        else:
+            self.fallback_banner.props.title = _("Using servers snapshot from the project repository.")
+            self.fallback_banner.props.revealed = True
         self.set_servers(servers, source=source)
         self.title_widget.props.subtitle = _(
             "{count} public relay servers · updated {time}").format(
