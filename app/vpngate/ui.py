@@ -498,6 +498,7 @@ class VpnGateApp(Adw.Application):
             ("escape", ["Escape"]),
             ("settings", ["<Primary>comma"]),
             ("about", []),
+            ("quit", ["<Primary>Q"]),
         ):
             action = Gio.SimpleAction.new(name, None)
             action.connect("activate", self._dispatch)
@@ -534,6 +535,10 @@ class VpnGateApp(Adw.Application):
                 if os.path.isdir(candidate):
                     theme.add_search_path(candidate)
                     theme.add_search_path(os.path.dirname(candidate))
+        if getattr(self, "win", None) is not None:
+            self.win.set_visible(True)
+            self.win.present()
+            return
         self.win = VpnGateWindow(self)
         self.win.present()
         if self.settings.get("tray", True):
@@ -591,6 +596,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._session_started = 0.0
         self._search_id: Optional[int] = None
         self.tray: Optional[Tray] = None
+        self._app_held = False
 
         disp = Gdk.Display.get_default()
         monitors = disp.get_monitors() if disp else None
@@ -2832,14 +2838,17 @@ class VpnGateWindow(Adw.ApplicationWindow):
         tray_group = Adw.PreferencesGroup(title=_("Options"))
         tray_row = Adw.SwitchRow(
             title=_("Status icon in the system tray"),
-            subtitle=_("Small helper process; goes away with the app"))
+            subtitle=_("Stay reachable from the system tray when closing the window"))
         tray_row.set_active(bool(self.settings.get("tray", True)))
 
         def tray_toggled(row: Adw.SwitchRow, _param) -> None:   # noqa: ANN001
             self.settings["tray"] = row.props.active
             save_settings(self.settings)
-            if self.tray is None and row.props.active:
-                self.setup_tray()
+            if row.props.active:
+                if self.tray is None:
+                    self.setup_tray()
+            else:
+                self._stop_tray()
         tray_row.connect("notify::active", tray_toggled)
         tray_group.add(tray_row)
         page.add(tray_group)
@@ -2990,8 +2999,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
                         try:
                             if self.worker is not None and hasattr(self.worker, "kill"):
                                 self.worker.kill()
-                            if hasattr(self, "tray") and self.tray is not None and getattr(self.tray, "_proc", None):
-                                self.tray._proc.kill()
+                            self._stop_tray()
                         except Exception:
                             pass
                         os._exit(0)
@@ -3272,16 +3280,37 @@ class VpnGateWindow(Adw.ApplicationWindow):
     def setup_tray(self) -> None:
         try:
             self.tray = Tray(ICONS_DIR, self._on_tray_action)
-            self.tray.set_state(self.state or "idle")
-            self.tray.set_menu(connect_enabled=self._can_connect(),
-                               disconnect_enabled=False)
+            if self.tray.is_available():
+                self.tray.set_state(self.state or "idle")
+                self.tray.set_menu(connect_enabled=self._can_connect(),
+                                   disconnect_enabled=(self.state == "connected"))
+                if not getattr(self, "_app_held", False):
+                    self.app.hold()
+                    self._app_held = True
+            else:
+                self.tray = None
         except Exception as exc:                       # noqa: BLE001
             self.tray = None
             print(f"tray disabled: {exc}", file=sys.stderr)
 
+    def _stop_tray(self) -> None:
+        if self.tray is not None:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
+            self.tray = None
+        if getattr(self, "_app_held", False):
+            self.app.release()
+            self._app_held = False
+
+    def _show_window(self) -> None:
+        self.set_visible(True)
+        self.present()
+
     def _on_tray_action(self, action: str) -> None:
         if action == "show":
-            GLib.idle_add(self.present)
+            GLib.idle_add(self._show_window)
         elif action == "connect":
             GLib.idle_add(self.act_connect_quick)
         elif action == "disconnect":
@@ -3302,9 +3331,11 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._manual_disconnect = True
         self._cancel_auto_reconnect()
         self._send({"cmd": "quit"})
-        if self.tray is not None:
-            self.tray.stop()
+        self._stop_tray()
         self.get_application().quit()
+
+    def act_quit(self) -> None:
+        self._quit()
 
     def _close_everything(self) -> None:
         self.state = "idle"
@@ -3317,6 +3348,9 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._update_buttons()
 
     def do_close_request(self, *_args) -> bool:
+        if self.settings.get("tray", True) and self.tray is not None and self.tray.is_available():
+            self.set_visible(False)
+            return True
         self._quit()
         return True
 
