@@ -97,6 +97,7 @@ def build_pyinstaller(build_dir: Path, dist_dir: Path) -> Path:
         "--noconfirm",
         "--onedir",
         "--clean",
+        "--noconsole",
         "--name", "vpngate-gui",
         *icon_args,
         "--distpath", str(bundle_dir),

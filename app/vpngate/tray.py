@@ -50,9 +50,9 @@ class _Win32Tray:
         ctypes = self._ctypes
         wintypes = self._wintypes
 
-        self._LRESULT = ctypes.c_int64
-        self._WPARAM = ctypes.c_uint64
-        self._LPARAM = ctypes.c_int64
+        self._LRESULT = wintypes.LPARAM
+        self._WPARAM = wintypes.WPARAM
+        self._LPARAM = wintypes.LPARAM
 
         self._user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, self._WPARAM, self._LPARAM]
         self._user32.DefWindowProcW.restype = self._LRESULT
@@ -124,24 +124,68 @@ class _Win32Tray:
     def is_available(self) -> bool:
         return self._available
 
-    def _get_icon_handle(self, name: str) -> Optional[int]:
+    def _get_app_icon_handle(self) -> Optional[int]:
+        hinst = self._kernel32.GetModuleHandleW(None)
+        module_dir = os.path.dirname(os.path.abspath(__file__))
         candidates = [
-            os.path.join(self._icon_dir, f"{name}.ico"),
-            os.path.join(self._icon_dir, f"vpngate-tray-{name}.ico"),
             os.path.join(self._icon_dir, "vpngate.ico"),
-            os.path.join(os.path.dirname(self._icon_dir), "icons", f"vpngate-tray-{name}.ico"),
-            os.path.join(os.path.dirname(self._icon_dir), "icons", "vpngate.ico"),
+            os.path.join(os.path.dirname(self._icon_dir), "vpngate.ico"),
+            os.path.join(os.path.dirname(os.path.dirname(self._icon_dir)), "vpngate.ico"),
+            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(self._icon_dir))), "vpngate.ico"),
+            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(self._icon_dir)))), "vpngate.ico"),
+            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(self._icon_dir)))), "app", "icons", "vpngate.ico"),
+            os.path.join(module_dir, "icons", "vpngate.ico"),
+            os.path.join(os.path.dirname(module_dir), "icons", "vpngate.ico"),
+            os.path.join(os.path.dirname(module_dir), "app", "icons", "vpngate.ico"),
         ]
+        if getattr(sys, "frozen", False):
+            base_dir = os.path.dirname(sys.executable)
+            candidates.extend([
+                os.path.join(base_dir, "icons", "vpngate.ico"),
+                os.path.join(base_dir, "_internal", "icons", "vpngate.ico"),
+            ])
+            if hasattr(sys, "_MEIPASS"):
+                candidates.extend([
+                    os.path.join(sys._MEIPASS, "icons", "vpngate.ico"),
+                    os.path.join(sys._MEIPASS, "app", "icons", "vpngate.ico"),
+                ])
+
         IMAGE_ICON = 1
         LR_LOADFROMFILE = 0x0010
         LR_DEFAULTSIZE = 0x0040
         for p in candidates:
             if os.path.isfile(p):
-                h = self._user32.LoadImageW(None, os.path.abspath(p), IMAGE_ICON, 0, 0,
-                                            LR_LOADFROMFILE | LR_DEFAULTSIZE)
-                if h:
+                try:
+                    h = self._user32.LoadImageW(None, os.path.abspath(p), IMAGE_ICON, 0, 0,
+                                                LR_LOADFROMFILE | LR_DEFAULTSIZE)
+                    if h:
+                        return h
+                except Exception:
+                    pass
+
+        # Try extracting application icon embedded in executable
+        try:
+            exe = sys.executable
+            if exe and os.path.isfile(exe):
+                h = self._shell32.ExtractIconW(hinst, exe, 0)
+                if h and int(h) > 1:
                     return h
+        except Exception:
+            pass
+
+        # Fallback to standard Windows application icon
+        try:
+            IDI_APPLICATION = 32512
+            h = self._user32.LoadIconW(0, IDI_APPLICATION)
+            if h:
+                return h
+        except Exception:
+            pass
+
         return None
+
+    def _get_icon_handle(self, _name: str = "") -> Optional[int]:
+        return self._get_app_icon_handle()
 
     def _wndproc(self, hwnd: int, msg: int, wparam: int, lparam: int) -> int:
         WM_USER = 0x0400
@@ -214,6 +258,9 @@ class _Win32Tray:
 
         # Attach to Default interactive desktop if possible
         try:
+            hwinsta = self._user32.OpenWindowStationW("WinSta0", False, 0x037F)
+            if hwinsta:
+                self._user32.SetProcessWindowStation(hwinsta)
             h_default = self._user32.OpenDesktopW("Default", 0, False, 0x01FF)
             if h_default:
                 self._user32.SetThreadDesktop(h_default)
@@ -241,7 +288,7 @@ class _Win32Tray:
             return
 
         self._hwnd = hwnd
-        self._current_hicon = self._get_icon_handle("idle")
+        self._current_hicon = self._get_app_icon_handle()
 
         WM_USER = 0x0400
         NIF_MESSAGE = 0x00000001
@@ -280,23 +327,18 @@ class _Win32Tray:
         if not self._available or not self._hwnd or not self._nid:
             return
         mapping = {
-            "idle": ("idle", "VPN Gate Client - disconnected"),
-            "authorizing": ("connecting", "VPN Gate Client - requesting privileges ..."),
-            "connecting": ("connecting", "VPN Gate Client - connecting ..."),
-            "connected": ("connected", "VPN Gate Client - connected"),
-            "error": ("error", "VPN Gate Client - error"),
+            "idle": "VPN Gate Client - disconnected",
+            "authorizing": "VPN Gate Client - requesting privileges ...",
+            "connecting": "VPN Gate Client - connecting ...",
+            "connected": "VPN Gate Client - connected",
+            "error": "VPN Gate Client - error",
         }
-        icon_name, text = mapping.get(status, mapping["idle"])
-        new_hicon = self._get_icon_handle(icon_name)
+        text = mapping.get(status, mapping["idle"])
         self._nid.szTip = text[:127]
-        if new_hicon:
-            self._nid.hIcon = new_hicon
+        if not self._nid.hIcon and self._current_hicon:
+            self._nid.hIcon = self._current_hicon
         NIM_MODIFY = 0x00000001
         self._shell32.Shell_NotifyIconW(NIM_MODIFY, self._ctypes.byref(self._nid))
-        if new_hicon and new_hicon != self._current_hicon:
-            if self._current_hicon:
-                self._user32.DestroyIcon(self._current_hicon)
-            self._current_hicon = new_hicon
 
     def set_menu(self, **flags: bool) -> None:
         self._flags.update(flags)
@@ -416,7 +458,7 @@ class _DBusTray:
         self._menu_reg_id = 0
         self._owner_id = 0
         self._available = False
-        self._icon_name = "vpngate-tray-idle"
+        self._icon_name = "com.vpngate.client"
         self._tooltip = "VPN Gate Client - disconnected"
         self._menu_revision = 1
         self._flags = {"connect_enabled": True, "disconnect_enabled": False}
@@ -604,15 +646,14 @@ class _DBusTray:
 
     def set_state(self, status: str) -> None:
         mapping = {
-            "idle": ("vpngate-tray-idle", "VPN Gate Client - disconnected"),
-            "authorizing": ("vpngate-tray-connecting", "VPN Gate Client - requesting privileges ..."),
-            "connecting": ("vpngate-tray-connecting", "VPN Gate Client - connecting ..."),
-            "connected": ("vpngate-tray-connected", "VPN Gate Client - connected"),
-            "error": ("vpngate-tray-error", "VPN Gate Client - error"),
+            "idle": "VPN Gate Client - disconnected",
+            "authorizing": "VPN Gate Client - requesting privileges ...",
+            "connecting": "VPN Gate Client - connecting ...",
+            "connected": "VPN Gate Client - connected",
+            "error": "VPN Gate Client - error",
         }
-        icon, text = mapping.get(status, mapping["idle"])
-        self._icon_name = icon
-        self._tooltip = text
+        self._icon_name = "com.vpngate.client"
+        self._tooltip = mapping.get(status, mapping["idle"])
         if self._conn:
             try:
                 self._conn.emit_signal(
@@ -677,7 +718,7 @@ class _ProcessTray:
         self._on_action = on_action
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
-        self._state = {"icon": "vpngate-tray-idle"}
+        self._state = {"icon": "com.vpngate.client"}
         self._start()
 
     def is_available(self) -> bool:
@@ -741,14 +782,14 @@ class _ProcessTray:
 
     def set_state(self, status: str) -> None:
         mapping = {
-            "idle": ("vpngate-tray-idle", "VPN Gate Client - disconnected"),
-            "authorizing": ("vpngate-tray-connecting", "VPN Gate Client - requesting privileges ..."),
-            "connecting": ("vpngate-tray-connecting", "VPN Gate Client - connecting ..."),
-            "connected": ("vpngate-tray-connected", "VPN Gate Client - connected"),
-            "error": ("vpngate-tray-error", "VPN Gate Client - error"),
+            "idle": "VPN Gate Client - disconnected",
+            "authorizing": "VPN Gate Client - requesting privileges ...",
+            "connecting": "VPN Gate Client - connecting ...",
+            "connected": "VPN Gate Client - connected",
+            "error": "VPN Gate Client - error",
         }
-        icon, text = mapping.get(status, mapping["idle"])
-        self._state = {"icon": icon, "tooltip": text}
+        text = mapping.get(status, mapping["idle"])
+        self._state = {"icon": "com.vpngate.client", "tooltip": text}
         self._send(self._state)
 
     def set_menu(self, **flags: bool) -> None:

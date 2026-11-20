@@ -3,6 +3,16 @@
 import os
 import sys
 
+# On Windows, suppress/hide any attached console window immediately
+if sys.platform == "win32":
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+    except Exception:
+        pass
+
 # On Windows, GTK4's OpenGL renderer fails on popups/menus without Direct Composition
 # ("Failed to realize renderer 'GskGLRenderer' for surface 'GdkWin32Popup'").
 # Cairo is native, extremely reliable, and avoids this requirement.

@@ -33,7 +33,7 @@ def main() -> int:                                     # noqa: C901
         _fail(f"tray bindings unavailable: {exc}")
 
     indicator = AppIndicator3.Indicator.new(
-        "com.vpngate.client", "vpngate-tray-idle",
+        "com.vpngate.client", "com.vpngate.client",
         AppIndicator3.IndicatorCategory.APPLICATION_STATUS)
     indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
     import os                                           # noqa: E402  (late)
