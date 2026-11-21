@@ -17,6 +17,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -571,6 +572,8 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._last_connected_server: Optional[VpnServer] = None
         self._last_connected_protocol: Optional[Protocol] = None
         self._manual_disconnect = False
+        self._notified_connected = False
+        self._last_disconnect_notify_time = 0.0
         self._auto_reconnect_attempt = 0
         self._auto_reconnect_timer_id: Optional[int] = None
         self._watchdog_in_flight = False
@@ -1756,6 +1759,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._last_connected_server = server
         self._last_connected_protocol = protocol
         self._manual_disconnect = False
+        self._notified_connected = False
         self._aborting = False
         self._hide_chips()
         timeout = int(self.settings.get("connect_timeout", DEFAULT_CONNECT_TIMEOUT))
@@ -1986,6 +1990,8 @@ class VpnGateWindow(Adw.ApplicationWindow):
                 GLib.idle_add(self._append_log, f"[helper] {line}")
 
     def _worker_gone(self) -> bool:
+        was_connected = getattr(self, "_notified_connected", False) or (self.state == "connected")
+        self._notified_connected = False
         self.worker = None
         self.worker_method = ""
         self._sudo_password = None
@@ -2000,6 +2006,14 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self.hero_title.set_label(_("Disconnected"))
         self.hero_sub.set_text(_("The helper stopped; back to idle."))
         self._update_buttons()
+        if was_connected:
+            now = time.time()
+            if now - getattr(self, "_last_disconnect_notify_time", 0.0) > 2.0:
+                self._last_disconnect_notify_time = now
+                self.notify_system(
+                    _("VPN Disconnected"),
+                    _("The VPN helper process stopped. You are no longer protected!"),
+                    level="alarm")
         return False
 
     def _send(self, command: dict) -> None:
@@ -2053,7 +2067,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
             if self._aborting:
                 pass                         # stopping already; wait for it
             elif self.state in ("connecting", "connected"):
-                was_connected = (self.state == "connected")
+                was_connected = (self.state == "connected") or getattr(self, "_notified_connected", False)
                 self.hero_ring.set_mode("error")
                 self.hero_title.set_label(_("Connection failed"))
                 self.hero_sub.set_text(_("Connection failed. Check log for details."))
@@ -2063,6 +2077,15 @@ class VpnGateWindow(Adw.ApplicationWindow):
                 if len(toast_msg) > 60:
                     toast_msg = toast_msg[:57] + "…"
                 self.toast(toast_msg)
+                if was_connected:
+                    self._notified_connected = False
+                    now = time.time()
+                    if now - getattr(self, "_last_disconnect_notify_time", 0.0) > 2.0:
+                        self._last_disconnect_notify_time = now
+                        self.notify_system(
+                            _("VPN Disconnected"),
+                            _("VPN connection lost: {detail}. You are no longer protected!").format(detail=toast_msg),
+                            level="alarm")
                 if was_connected and not getattr(self, "_manual_disconnect", False) and bool(self.settings.get("auto_reconnect", DEFAULT_AUTO_RECONNECT)):
                     self._schedule_auto_reconnect()
         if kind == "bye":
@@ -2095,11 +2118,28 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self._handle_connected(info)
             self.toast(_("Connected via {server}").format(
                 server=info.get("server", "relay")))
+            if not getattr(self, "_notified_connected", False):
+                self._notified_connected = True
+                server_name = info.get("server") or (self.selected.hostname if self.selected else "VPN Gate relay")
+                country = info.get("country") or (self.selected.country_long if self.selected else "")
+                proto = str(info.get("protocol") or "").upper()
+                if country and proto:
+                    msg = _("Connected to {country} ({server}) via {proto}. Your internet traffic is encrypted.").format(
+                        country=country, server=server_name, proto=proto)
+                elif proto:
+                    msg = _("Connected to {server} via {proto}. Your internet traffic is encrypted.").format(
+                        server=server_name, proto=proto)
+                else:
+                    msg = _("Connected to {server}. Your internet traffic is encrypted.").format(
+                        server=server_name)
+                self.notify_system(_("VPN Connected"), msg, level="info")
         elif state == "disconnected":
             stopped = self._aborting
             self._aborting = False
             manual = getattr(self, "_manual_disconnect", False)
             self._manual_disconnect = False
+            was_connected = getattr(self, "_notified_connected", False) or (self.state == "connected")
+            self._notified_connected = False
             if stopped:
                 self.state = "idle"
                 self.hero_ring.set_mode("idle")
@@ -2117,6 +2157,15 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self._last_connectivity_log_time = 0.0
             self._hide_chips()
             self._update_buttons()
+            if was_connected:
+                now = time.time()
+                if now - getattr(self, "_last_disconnect_notify_time", 0.0) > 2.0:
+                    self._last_disconnect_notify_time = now
+                    if manual or stopped:
+                        msg = _("VPN connection disconnected. You are no longer protected.")
+                    else:
+                        msg = _("VPN connection dropped! Your traffic is no longer protected.")
+                    self.notify_system(_("VPN Disconnected"), msg, level="alarm")
             if not stopped and not manual and bool(self.settings.get("auto_reconnect", DEFAULT_AUTO_RECONNECT)):
                 self._schedule_auto_reconnect()
 
@@ -2851,6 +2900,18 @@ class VpnGateWindow(Adw.ApplicationWindow):
                 self._stop_tray()
         tray_row.connect("notify::active", tray_toggled)
         tray_group.add(tray_row)
+
+        notify_row = Adw.SwitchRow(
+            title=_("Connection notifications"),
+            subtitle=_("Alarm and notify via desktop notification on connect or disconnect"))
+        notify_row.set_active(bool(self.settings.get("notifications", True)))
+
+        def notify_toggled(row: Adw.SwitchRow, _param) -> None:   # noqa: ANN001
+            self.settings["notifications"] = row.props.active
+            save_settings(self.settings)
+
+        notify_row.connect("notify::active", notify_toggled)
+        tray_group.add(notify_row)
         page.add(tray_group)
 
         reset_group = Adw.PreferencesGroup()
@@ -3303,6 +3364,58 @@ class VpnGateWindow(Adw.ApplicationWindow):
         if getattr(self, "_app_held", False):
             self.app.release()
             self._app_held = False
+
+    def notify_system(self, title: str, message: str, level: str = "info") -> None:
+        """Deliver an operating system desktop notification to alarm/inform the user."""
+        if not bool(self.settings.get("notifications", True)):
+            return
+
+        # 1. Platform-appropriate Tray backend notification
+        if self.tray is not None and self.tray.is_available():
+            try:
+                if self.tray.notify(title, message, level):
+                    return
+            except Exception:
+                pass
+
+        # 2. Windows standalone fallback
+        if sys.platform == "win32":
+            try:
+                from .tray import win32_standalone_notify
+                win32_standalone_notify(title, message, level)
+                return
+            except Exception:
+                pass
+
+        # 3. Linux Gtk / Gio.Application notification
+        app = self.get_application()
+        if app is not None:
+            try:
+                from gi.repository import Gio
+                n = Gio.Notification.new(title)
+                n.set_body(message)
+                if level in ("warning", "error", "alarm"):
+                    n.set_priority(Gio.NotificationPriority.URGENT)
+                else:
+                    n.set_priority(Gio.NotificationPriority.NORMAL)
+                n.set_icon(Gio.ThemedIcon.new("com.vpngate.client"))
+                app.send_notification("vpngate-tunnel-status", n)
+                return
+            except Exception:
+                pass
+
+        # 4. Linux notify-send CLI fallback
+        if sys.platform != "win32":
+            try:
+                import shutil
+                if shutil.which("notify-send"):
+                    urgency = "critical" if level in ("warning", "error", "alarm") else "normal"
+                    subprocess.Popen(
+                        ["notify-send", "-a", "VPN Gate Client", "-u", urgency, "-i", "com.vpngate.client", title, message],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+            except Exception:
+                pass
 
     def _show_window(self) -> None:
         self.set_visible(True)

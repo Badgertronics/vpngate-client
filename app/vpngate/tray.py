@@ -340,6 +340,35 @@ class _Win32Tray:
         NIM_MODIFY = 0x00000001
         self._shell32.Shell_NotifyIconW(NIM_MODIFY, self._ctypes.byref(self._nid))
 
+    def notify(self, title: str, message: str, level: str = "info") -> bool:
+        if not self._available or not self._hwnd or not self._nid:
+            return False
+        try:
+            try:
+                hwinsta = self._user32.OpenWindowStationW("WinSta0", False, 0x037F)
+                if hwinsta:
+                    self._user32.SetProcessWindowStation(hwinsta)
+                hdesk = self._user32.OpenDesktopW("Default", 0, False, 0x01FF)
+                if hdesk:
+                    self._user32.SetThreadDesktop(hdesk)
+            except Exception:
+                pass
+
+            NIF_INFO = 0x00000010
+            NIIF_INFO = 0x00000001
+            NIIF_WARNING = 0x00000002
+            flag = NIIF_WARNING if level in ("warning", "error", "alarm") else NIIF_INFO
+
+            self._nid.uFlags = 1 | 2 | 4 | NIF_INFO
+            self._nid.szInfoTitle = title[:63]
+            self._nid.szInfo = message[:255]
+            self._nid.dwInfoFlags = flag
+            NIM_MODIFY = 0x00000001
+            ret = self._shell32.Shell_NotifyIconW(NIM_MODIFY, self._ctypes.byref(self._nid))
+            return bool(ret)
+        except Exception:
+            return False
+
     def set_menu(self, **flags: bool) -> None:
         self._flags.update(flags)
 
@@ -348,6 +377,139 @@ class _Win32Tray:
             WM_CLOSE = 0x0010
             self._user32.PostMessageW(self._hwnd, WM_CLOSE, 0, 0)
         self._thread.join(timeout=2)
+
+
+def win32_standalone_notify(title: str, message: str, level: str = "info") -> bool:
+    """Show a Windows desktop toast/balloon notification without requiring an active tray object."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import time
+
+        user32 = ctypes.windll.user32
+        shell32 = ctypes.windll.shell32
+        kernel32 = ctypes.windll.kernel32
+
+        try:
+            hwinsta = user32.OpenWindowStationW("WinSta0", False, 0x037F)
+            if hwinsta:
+                user32.SetProcessWindowStation(hwinsta)
+            hdesk = user32.OpenDesktopW("Default", 0, False, 0x01FF)
+            if hdesk:
+                user32.SetThreadDesktop(hdesk)
+        except Exception:
+            pass
+
+        user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.DefWindowProcW.restype = wintypes.LPARAM
+        WNDPROC = ctypes.WINFUNCTYPE(wintypes.LPARAM, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        def wndproc(hwnd, msg, wparam, lparam):
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+        wndproc_ptr = WNDPROC(wndproc)
+
+        class WNDCLASSEXW(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.UINT),
+                ("style", wintypes.UINT),
+                ("lpfnWndProc", WNDPROC),
+                ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE),
+                ("hIcon", wintypes.HICON),
+                ("hCursor", wintypes.HCURSOR),
+                ("hbrBackground", wintypes.HBRUSH),
+                ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR),
+                ("hIconSm", wintypes.HICON),
+            ]
+
+        cls_name = f"VpnGateNotifyCls_{os.getpid()}_{time.time_ns()}"
+        hinst = kernel32.GetModuleHandleW(None)
+        wcex = WNDCLASSEXW()
+        wcex.cbSize = ctypes.sizeof(WNDCLASSEXW)
+        wcex.lpfnWndProc = wndproc_ptr
+        wcex.hInstance = hinst
+        wcex.lpszClassName = cls_name
+        user32.RegisterClassExW(ctypes.byref(wcex))
+
+        hwnd = user32.CreateWindowExW(0, cls_name, "VpnGateNotify", 0, 0, 0, 0, 0, None, None, hinst, None)
+        if not hwnd:
+            return False
+
+        class VERSION_OR_TIMEOUT(ctypes.Union):
+            _fields_ = [("uTimeout", wintypes.UINT), ("uVersion", wintypes.UINT)]
+        class GUID(ctypes.Structure):
+            _fields_ = [("Data1", wintypes.ULONG), ("Data2", wintypes.WORD), ("Data3", wintypes.WORD), ("Data4", wintypes.BYTE * 8)]
+        class NOTIFYICONDATAW(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("hWnd", wintypes.HWND),
+                ("uID", wintypes.UINT),
+                ("uFlags", wintypes.UINT),
+                ("uCallbackMessage", wintypes.UINT),
+                ("hIcon", wintypes.HICON),
+                ("szTip", wintypes.WCHAR * 128),
+                ("dwState", wintypes.DWORD),
+                ("dwStateMask", wintypes.DWORD),
+                ("szInfo", wintypes.WCHAR * 256),
+                ("version_or_timeout", VERSION_OR_TIMEOUT),
+                ("szInfoTitle", wintypes.WCHAR * 64),
+                ("dwInfoFlags", wintypes.DWORD),
+                ("guidItem", GUID),
+                ("hBalloonIcon", wintypes.HICON),
+            ]
+            _anonymous_ = ["version_or_timeout"]
+
+        shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+        shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+
+        icon_candidates = [
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "icons", "vpngate.ico"),
+            os.path.join(os.path.dirname(sys.executable), "icons", "vpngate.ico") if getattr(sys, "frozen", False) else "",
+            os.path.join(os.path.dirname(sys.executable), "_internal", "icons", "vpngate.ico") if getattr(sys, "frozen", False) else "",
+        ]
+        hicon = None
+        for p in icon_candidates:
+            if p and os.path.isfile(p):
+                hicon = user32.LoadImageW(None, os.path.abspath(p), 1, 0, 0, 0x0010 | 0x0040)
+                if hicon:
+                    break
+        if not hicon and getattr(sys, "frozen", False) and sys.executable:
+            hicon = shell32.ExtractIconW(hinst, sys.executable, 0)
+        if not hicon or int(hicon) <= 1:
+            hicon = user32.LoadIconW(0, 32512)
+
+        flag = 0x00000002 if level in ("warning", "error", "alarm") else 0x00000001
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        nid.hWnd = hwnd
+        nid.uID = 1
+        nid.uFlags = 1 | 2 | 4 | 0x00000010
+        nid.uCallbackMessage = 0x0400 + 20
+        nid.hIcon = hicon
+        nid.szTip = "VPN Gate Client"
+        nid.szInfoTitle = title[:63]
+        nid.szInfo = message[:255]
+        nid.dwInfoFlags = flag
+
+        ret = shell32.Shell_NotifyIconW(0, ctypes.byref(nid))
+
+        def cleanup():
+            time.sleep(4)
+            try:
+                shell32.Shell_NotifyIconW(2, ctypes.byref(nid))
+                user32.DestroyWindow(hwnd)
+                if hicon and int(hicon) > 1:
+                    user32.DestroyIcon(hicon)
+            except Exception:
+                pass
+
+        threading.Thread(target=cleanup, daemon=True).start()
+        return bool(ret)
+    except Exception:
+        return False
 
 
 # ============================================================================
@@ -688,6 +850,43 @@ class _DBusTray:
             except Exception:
                 pass
 
+    def notify(self, title: str, message: str, level: str = "info") -> bool:
+        if self._conn:
+            try:
+                urgency = 2 if level in ("warning", "error", "alarm") else 1
+                hints = {
+                    "urgency": self._GLib.Variant("y", urgency),
+                }
+                parameters = self._GLib.Variant(
+                    "(susssasa{sv}i)",
+                    (
+                        "VPN Gate Client",
+                        0,
+                        "com.vpngate.client",
+                        title,
+                        message,
+                        [],
+                        hints,
+                        7000 if urgency == 2 else 5000,
+                    ),
+                )
+                self._conn.call(
+                    "org.freedesktop.Notifications",
+                    "/org/freedesktop/Notifications",
+                    "org.freedesktop.Notifications",
+                    "Notify",
+                    parameters,
+                    None,
+                    self._Gio.DBusCallFlags.NONE,
+                    1500,
+                    None,
+                    None,
+                )
+                return True
+            except Exception:
+                pass
+        return False
+
     def stop(self) -> None:
         if self._conn:
             try:
@@ -795,6 +994,10 @@ class _ProcessTray:
     def set_menu(self, **flags: bool) -> None:
         self._send({"event": "menu", **flags})
 
+    def notify(self, title: str, message: str, level: str = "info") -> bool:
+        self._send({"event": "notify", "title": title, "message": message, "level": level})
+        return True
+
     def stop(self) -> None:
         with self._lock:
             proc, self._proc = self._proc, None
@@ -854,6 +1057,11 @@ class Tray:
     def set_menu(self, **flags: bool) -> None:
         if self._backend:
             self._backend.set_menu(**flags)
+
+    def notify(self, title: str, message: str, level: str = "info") -> bool:
+        if self._backend and hasattr(self._backend, "notify"):
+            return self._backend.notify(title, message, level)
+        return False
 
     def stop(self) -> None:
         if self._backend:

@@ -95,6 +95,21 @@ def main() -> int:                                     # noqa: C901
                           if k in ("show", "connect_enabled",
                                    "disconnect_enabled")})
             build_menu()
+        elif payload.get("event") == "notify":
+            title = payload.get("title", "VPN Gate Client")
+            message = payload.get("message", "")
+            level = payload.get("level", "info")
+            urgency = "critical" if level in ("warning", "error", "alarm") else "normal"
+            import shutil
+            import subprocess
+            if shutil.which("notify-send"):
+                try:
+                    subprocess.Popen(
+                        ["notify-send", "-a", "VPN Gate Client", "-u", urgency, "-i", "com.vpngate.client", title, message],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                except Exception:
+                    pass
         elif payload.get("cmd") == "quit":
             GLib.idle_add(Gtk.main_quit)
             return GLib.SOURCE_REMOVE
