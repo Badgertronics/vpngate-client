@@ -62,7 +62,7 @@ class Worker:
                 code = proc.returncode
                 self._log(f"Tunnel process terminated (exit code {code}).")
                 _emit({"event": "error", "message": f"VPN tunnel process stopped (code {code})."})
-                self.do_disconnect()
+                self.do_disconnect(expected_conn=conn)
                 continue
 
             # 2. Windows RAS VPN check (MS-SSTP / L2TP)
@@ -78,7 +78,7 @@ class Worker:
                             self._win_vpn_missed = 0
                             self._log(f"Windows VPN '{win_vpn}' connection dropped.")
                             _emit({"event": "error", "message": f"Windows VPN '{win_vpn}' connection dropped."})
-                            self.do_disconnect()
+                            self.do_disconnect(expected_conn=conn)
                     else:
                         self._win_vpn_missed = 0
                 except Exception:
@@ -114,9 +114,11 @@ class Worker:
 
     def do_abort_or_disconnect(self) -> None:
         old_thread = None
+        was_connecting = False
         with self._connect_lock:
             self._active_attempt_id += 1
             if self._is_connecting:
+                was_connecting = True
                 self._log("Cancelling in-progress connection attempt ...")
                 if self._connecting_backend is not None:
                     try:
@@ -136,10 +138,11 @@ class Worker:
         if old_thread is not None:
             old_thread.join(timeout=2.0)
 
-        self.do_disconnect()
+        self.do_disconnect(emit_state=not was_connecting)
 
     def start_connect(self, command: dict) -> None:
         old_thread = None
+        has_old_conn = False
         with self._connect_lock:
             self._active_attempt_id += 1
             attempt_id = self._active_attempt_id
@@ -158,10 +161,13 @@ class Worker:
                 self._connect_thread = None
 
             if self.connection is not None:
-                self.do_disconnect(emit_state=False)
+                has_old_conn = True
 
         if old_thread is not None:
             old_thread.join(timeout=2.0)
+
+        if has_old_conn:
+            self.do_disconnect(emit_state=False)
 
         with self._connect_lock:
             if self._active_attempt_id != attempt_id:
@@ -274,10 +280,19 @@ class Worker:
             external = netutil.external_ip()
         except Exception:                          # noqa: BLE001
             pass
-        info["external_ip"] = external
-        _emit({"event": "connected", "info": _jsonable(info)})
-        _emit({"event": "state", "state": "connected", "protocol": protocol.value,
-               "message": f"Connected to {server.hostname} via {backend.name}"})
+
+        with self._connect_lock:
+            if self._active_attempt_id != attempt_id or self.connection is not info:
+                # Connection was aborted or superseded while resolving external IP
+                try:
+                    backend.disconnect(info, self._log)
+                except Exception:
+                    pass
+                return
+            info["external_ip"] = external
+            _emit({"event": "connected", "info": _jsonable(info)})
+            _emit({"event": "state", "state": "connected", "protocol": protocol.value,
+                   "message": f"Connected to {server.hostname} via {backend.name}"})
 
     def do_disconnect(self, emit_state: bool = True, expected_conn: Optional[dict] = None) -> None:
         self._win_vpn_missed = 0

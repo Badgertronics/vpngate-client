@@ -182,6 +182,43 @@ class TestWorkerEdgeCases:
             # Cancelled state emitted
             cancelled = [call[0][0] for call in mock_emit.call_args_list if call[0][0].get("message") == "Connection cancelled."]
             assert len(cancelled) == 1
+            # Exactly one state: disconnected event must be emitted (no duplicate)
+            disconnected_states = [call[0][0] for call in mock_emit.call_args_list if call[0][0].get("event") == "state" and call[0][0].get("state") == "disconnected"]
+            assert len(disconnected_states) == 1
+
+    def test_worker_invalidation_during_external_ip_resolution(self):
+        """If worker is aborted or superseded while netutil.external_ip() is running, discard and disconnect."""
+        worker = Worker()
+        mock_backend = mock.MagicMock()
+        mock_backend.name = "MockBackend"
+        server = VpnServer()
+        server.hostname = "test_relay"
+        server.ip = "1.2.3.4"
+
+        attempt_id = 1
+        worker._is_connecting = True
+        worker._connecting_backend = mock_backend
+        worker._active_attempt_id = 1
+
+        info = {"server": "test_relay", "interface": "tun0"}
+        mock_backend.connect.return_value = info
+
+        def slow_external_ip():
+            # While external_ip is resolving, user presses abort / disconnect
+            worker.do_abort_or_disconnect()
+            return "8.8.8.8"
+
+        with mock.patch("vpngate.netutil.external_ip", side_effect=slow_external_ip), \
+             mock.patch("vpngate.worker._emit") as mock_emit:
+            worker._connect_thread_worker(mock_backend, server, Protocol.OPENVPN, 10, 1, attempt_id)
+
+            # Must have cleanly disconnected the info
+            assert mock_backend.disconnect.called
+            # Must NOT emit connected event
+            emitted_events = [call[0][0].get("event") for call in mock_emit.call_args_list]
+            assert "connected" not in emitted_events
+            # Final state in worker must not be connected
+            assert worker.connection is None
 
 
 # ============================================================================
@@ -197,6 +234,7 @@ class TestUiEdgeCases:
         win._manual_disconnect = False
         win._notified_connected = False
         win._tunnel_dropped_from_connected = False
+        win._auto_reconnecting = False
         win._auto_reconnect_attempt = 0
         win._auto_reconnect_timer_id = None
         win._spawning_worker = False
@@ -333,9 +371,10 @@ class TestUiEdgeCases:
     def test_worker_spawning_concurrency_guard_and_kill_on_abort(self):
         """Spawning worker must prevent concurrent spawns and kill newly spawned worker if aborted."""
         win = self._create_mock_window()
+        win.worker = None
         win._spawning_worker = False
 
-        # Start authorization sets _spawning_worker = True
+        # 1. Start authorization sets _spawning_worker = True
         with mock.patch("threading.Thread") as mock_thread:
             win._start_authorization()
             assert win._spawning_worker is True
@@ -346,13 +385,79 @@ class TestUiEdgeCases:
             win._start_authorization()
             mock_thread.assert_not_called()
 
-        # When worker starts while _aborting is True, proc.kill() must be called
-        mock_proc = mock.MagicMock()
-        win._aborting = True
-        win._worker_started(mock_proc, "windows")
+        # 2. While spawning is in flight, user clicks Stop (_abort_connect)
+        win.state = "authorizing"
+        win._abort_connect()
+        # _aborting must remain True because worker was spawning!
+        assert win._aborting is True
 
-        assert win._spawning_worker is False
-        mock_proc.kill.assert_called_once()
+        # 3. Background thread completes spawn and calls _worker_started
+        mock_proc = mock.MagicMock()
+        with mock.patch.object(win, "_update_buttons") as mock_update:
+            win._worker_started(mock_proc, "windows")
+
+            assert win._spawning_worker is False
+            assert win._aborting is False
+            assert win.state == "idle"
+            mock_proc.kill.assert_called_once()
+            mock_update.assert_called_once()
+
+    def test_auto_reconnect_multi_attempt_retry_loop(self):
+        """Verify auto-reconnect maintains retry counter across multiple failed dials up to max_attempts."""
+        win = self._create_mock_window()
+        win.state = "connected"
+        win._notified_connected = True
+        win.settings["auto_reconnect_retries"] = 3
+
+        # Drop 1: initial drop from connected
+        win._dispatch_event({"event": "error", "message": "Tunnel dropped"})
+        assert win._tunnel_dropped_from_connected is True
+
+        # Simulate timeout add to directly capture callback
+        scheduled_callbacks = []
+        def mock_timeout_add(delay, cb):
+            scheduled_callbacks.append(cb)
+            return 100 + len(scheduled_callbacks)
+
+        with mock.patch("gi.repository.GLib.timeout_add_seconds", side_effect=mock_timeout_add):
+            # Worker reports disconnected
+            win._handle_state({"state": "disconnected"})
+            assert win._auto_reconnecting is True
+            assert win._auto_reconnect_attempt == 1
+            assert len(scheduled_callbacks) == 1
+
+            # Fire reconnect attempt 1
+            scheduled_callbacks.pop(0)()
+            assert win._auto_reconnect_attempt == 1  # Not reset to 0!
+
+            # Attempt 1 fails: worker sends error + disconnected
+            win._dispatch_event({"event": "error", "message": "Dial 1 failed"})
+            win._handle_state({"state": "disconnected"})
+            assert win._auto_reconnecting is True
+            assert win._auto_reconnect_attempt == 2
+            assert len(scheduled_callbacks) == 1
+
+            # Fire reconnect attempt 2
+            scheduled_callbacks.pop(0)()
+            assert win._auto_reconnect_attempt == 2
+
+            # Attempt 2 fails
+            win._dispatch_event({"event": "error", "message": "Dial 2 failed"})
+            win._handle_state({"state": "disconnected"})
+            assert win._auto_reconnecting is True
+            assert win._auto_reconnect_attempt == 3
+            assert len(scheduled_callbacks) == 1
+
+            # Fire reconnect attempt 3
+            scheduled_callbacks.pop(0)()
+            assert win._auto_reconnect_attempt == 3
+
+            # Attempt 3 fails -> reaches max_attempts
+            win._dispatch_event({"event": "error", "message": "Dial 3 failed"})
+            win._handle_state({"state": "disconnected"})
+            # Must stop auto-reconnecting
+            assert win._auto_reconnecting is False
+            assert win._auto_reconnect_attempt == 0
 
 
 # ============================================================================
@@ -495,3 +600,50 @@ class TestBackendsEdgeCases:
             mock_ps_proc.terminate.assert_called_once()
             mock_ps_proc.kill.assert_called_once()
             assert l2tp._active_proc is None
+
+    def test_softether_connect_windows_honors_abort_in_polling_loops(self):
+        """SoftEtherBackend._connect_windows raises BackendError immediately when _abort_requested is True."""
+        backend = SoftEtherBackend()
+        server = VpnServer()
+        server.hostname = "test_softether"
+        server.ip = "1.2.3.4"
+
+        server.ssl_vpn_port = 443
+        backend._abort_requested = True
+        with mock.patch.object(backend, "_run_commands") as mock_run:
+            with pytest.raises(BackendError, match="Connection aborted by user"):
+                backend._connect_windows(server, Protocol.SSLVP, mock.MagicMock(), "/tmp")
+            # Must run disconnect command to clean up
+            assert any("AccountDisconnect" in call[0][0][0] for call in mock_run.call_args_list)
+
+    def test_sstp_and_l2tp_connect_windows_honors_abort_before_rasdial(self):
+        """SstpBackend and L2tpBackend raise BackendError immediately if aborted before dialing."""
+        server = VpnServer()
+        server.hostname = "test_ras"
+        server.ip = "5.6.7.8"
+
+        mock_ps = mock.MagicMock()
+        mock_ps.communicate.return_value = ("", "")
+        mock_ps.returncode = 0
+
+        # 1. SSTP
+        sstp = SstpBackend()
+        sstp._abort_requested = True
+        with mock.patch("sys.platform", "win32"), \
+             mock.patch("subprocess.Popen", return_value=mock_ps), \
+             mock.patch.object(SstpBackend, "_configure_windows_vpn_pbk"), \
+             mock.patch("vpngate.backends._cleanup_windows_ras") as mock_clean:
+            with pytest.raises(BackendError, match="Connection aborted by user"):
+                sstp._connect_windows(server, Protocol.SSTP, mock.MagicMock(), "/tmp", 30, 1)
+            assert mock_clean.called
+
+        # 2. L2TP
+        l2tp = L2tpBackend()
+        l2tp._abort_requested = True
+        with mock.patch("sys.platform", "win32"), \
+             mock.patch("subprocess.Popen", return_value=mock_ps), \
+             mock.patch.object(SstpBackend, "_configure_windows_vpn_pbk"), \
+             mock.patch("vpngate.backends._cleanup_windows_ras") as mock_clean_l2tp:
+            with pytest.raises(BackendError, match="Connection aborted by user"):
+                l2tp._connect_windows(server, Protocol.L2TP, mock.MagicMock(), "/tmp", 30, 1)
+            assert mock_clean_l2tp.called

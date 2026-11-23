@@ -898,6 +898,9 @@ class SoftEtherBackend(Backend):
         deadline = time.time() + 35
         established = False
         while time.time() < deadline:
+            if self._abort_requested:
+                self._run_commands([f"AccountDisconnect {self.ACCOUNT}"], timeout=20)
+                raise BackendError("Connection aborted by user.")
             out = self._run_commands([f"AccountStatusGet {self.ACCOUNT}"], timeout=15)
             _status, is_connected = self._parse_status(out)
             if is_connected:
@@ -917,6 +920,9 @@ class SoftEtherBackend(Backend):
         ip_deadline = time.time() + 15
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         while time.time() < ip_deadline:
+            if self._abort_requested:
+                self._run_commands([f"AccountDisconnect {self.ACCOUNT}"], timeout=20)
+                raise BackendError("Connection aborted by user.")
             proc = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
                  "(Get-NetIPAddress -InterfaceAlias '*VPN*' -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '169.254.*' }).IPAddress"],
@@ -1203,9 +1209,11 @@ class SstpBackend(Backend):
                     pass
 
         _log_emit(emit, f"[sstp 2/3] Dialing {vpn_name} ({host}) via Windows RAS ...")
-        self._abort_requested = False
         self._active_vpn_name = vpn_name
         self._active_target_ips = target_ips
+        if self._abort_requested:
+            _cleanup_windows_ras(vpn_name, target_ips, active_proc=self._active_proc)
+            raise BackendError("Connection aborted by user.")
 
         retries = max(1, retries)
         output = ""
@@ -1614,9 +1622,11 @@ class L2tpBackend(Backend):
                     pass
 
         _log_emit(emit, f"[l2tp 2/3] Dialing {vpn_name} ({host}) via Windows RAS with PSK ...")
-        self._abort_requested = False
         self._active_vpn_name = vpn_name
         self._active_target_ips = target_ips
+        if self._abort_requested:
+            _cleanup_windows_ras(vpn_name, target_ips, active_proc=self._active_proc)
+            raise BackendError("Connection aborted by user.")
 
         retries = max(1, retries)
         output = ""

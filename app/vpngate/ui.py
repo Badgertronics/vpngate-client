@@ -590,6 +590,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._pending: Optional[tuple] = None        # (server, Protocol) for spawn
         self._spawning_worker: bool = False
         self._tunnel_dropped_from_connected: bool = False
+        self._auto_reconnecting: bool = False
         self._aborting = False                       # Stop pressed mid-dial
         self._auth_dialog: Optional[Adw.AlertDialog] = None
         self._dot_phase = 0                          # animated "connecting." dots
@@ -1733,12 +1734,16 @@ class VpnGateWindow(Adw.ApplicationWindow):
             else:
                 self.toast(_("This relay announces no protocols"))
                 return
+        self._auto_reconnecting = False
+        self._auto_reconnect_attempt = 0
         self._connect(server, protocol)
 
     def _on_quick_connect(self, _button, server: VpnServer) -> None:
         if not self._can_connect():
             return
         target_proto = Protocol.SSTP if sys.platform == "win32" else Protocol.SSLVP
+        self._auto_reconnecting = False
+        self._auto_reconnect_attempt = 0
         self._connect(server, target_proto)
 
     def act_connect_quick(self) -> None:
@@ -1749,8 +1754,9 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._on_connect_clicked()
 
     def _connect(self, server: VpnServer, protocol: Protocol) -> None:
-        self._cancel_auto_reconnect()
-        self._auto_reconnect_attempt = 0
+        if not getattr(self, "_auto_reconnecting", False):
+            self._cancel_auto_reconnect()
+            self._auto_reconnect_attempt = 0
         if not server.supports(protocol):
             self.toast(_("{host} does not speak this protocol").format(
                 host=server.hostname or server.ip))
@@ -1789,6 +1795,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._manual_disconnect = True
         self._auto_reconnect_attempt = 0
         self._cancel_auto_reconnect()
+        self._auto_reconnecting = False
         self._aborting = True
         self._pending = None
         self._append_log(_("Stop pressed — aborting the connection attempt"))
@@ -1802,8 +1809,11 @@ class VpnGateWindow(Adw.ApplicationWindow):
         if self.worker is not None and self.worker.poll() is None:
             self.hero_sub.set_text(_("Stopping …"))
             self._send({"cmd": "abort"})
+        elif getattr(self, "_spawning_worker", False):
+            self.hero_sub.set_text(_("Stopping …"))
         else:
             self._aborting = False
+            self.state = "idle"
             self._set_state("idle", _("Connection attempt stopped."))
         self._update_buttons()
 
@@ -1938,6 +1948,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         if self._aborting:
             # Stop was pressed while the dialog was still up.
             self._aborting = False
+            self.state = "idle"
             self._set_state("idle", _("Connection attempt stopped."))
             return
         if not password:
@@ -1958,6 +1969,10 @@ class VpnGateWindow(Adw.ApplicationWindow):
                 proc.kill()
             except Exception:
                 pass
+            self._aborting = False
+            self.state = "idle"
+            self._set_state("idle", _("Connection attempt stopped."))
+            self._update_buttons()
             return False
         self.worker = proc
         self.worker_method = method
@@ -2191,12 +2206,15 @@ class VpnGateWindow(Adw.ApplicationWindow):
                     else:
                         msg = _("VPN connection dropped! Your traffic is no longer protected.")
                     self.notify_system(_("VPN Disconnected"), msg, level="alarm")
-            if was_connected and not stopped and not manual and bool(self.settings.get("auto_reconnect", DEFAULT_AUTO_RECONNECT)):
+            if (was_connected or getattr(self, "_auto_reconnecting", False)) and not stopped and not manual and bool(self.settings.get("auto_reconnect", DEFAULT_AUTO_RECONNECT)):
                 self._schedule_auto_reconnect()
+            else:
+                self._auto_reconnecting = False
 
     def _handle_connected(self, info: dict) -> None:
         self._auto_reconnect_attempt = 0
         self._cancel_auto_reconnect()
+        self._auto_reconnecting = False
         self._has_logged_first_probe = False
         self._watchdog_failures = 0
         self._last_connectivity_log_time = 0.0
@@ -2322,9 +2340,11 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self._append_log(_("[auto-reconnect] Maximum reconnection attempts ({max_attempts}) reached. Stopping auto-reconnect.").format(
                 max_attempts=max_attempts))
             self.toast(_("Auto-reconnect stopped: max attempts reached"))
+            self._auto_reconnecting = False
             self._auto_reconnect_attempt = 0
             return
 
+        self._auto_reconnecting = True
         self._auto_reconnect_attempt = attempts
         self._cancel_auto_reconnect()
 
@@ -2341,6 +2361,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         def do_reconnect() -> bool:
             self._auto_reconnect_timer_id = None
             if getattr(self, "_aborting", False) or getattr(self, "_manual_disconnect", False) or self.state in ("connecting", "authorizing", "connected"):
+                self._auto_reconnecting = False
                 return False
             self._append_log(_("[auto-reconnect] Initiating reconnect attempt {attempt}/{max_attempts} to {host} ...").format(
                 attempt=attempts, max_attempts=max_attempts, host=host))
@@ -3472,12 +3493,14 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._manual_disconnect = True
         self._auto_reconnect_attempt = 0
         self._cancel_auto_reconnect()
+        self._auto_reconnecting = False
         self._append_log(_("Disconnecting the tunnel …"))
         self._send({"cmd": "disconnect"})
 
     def _quit(self) -> None:
         self._manual_disconnect = True
         self._cancel_auto_reconnect()
+        self._auto_reconnecting = False
         self._send({"cmd": "quit"})
         self._stop_tray()
         self.get_application().quit()
