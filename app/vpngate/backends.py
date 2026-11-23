@@ -881,6 +881,9 @@ class SoftEtherBackend(Backend):
 
         # Ensure Virtual NIC exists in SoftEther
         self._run_commands([f"NicCreate {self.NIC}", f"NicEnable {self.NIC}"], timeout=30)
+        if self._abort_requested:
+            self._run_commands([f"AccountDisconnect {self.ACCOUNT}"], timeout=20)
+            raise BackendError("Connection aborted by user.")
 
         # Clear any stale vpngate account session and dial
         commands = [
@@ -893,6 +896,9 @@ class SoftEtherBackend(Backend):
             f"AccountConnect {self.ACCOUNT}",
         ]
         self._run_commands(commands, timeout=40)
+        if self._abort_requested:
+            self._run_commands([f"AccountDisconnect {self.ACCOUNT}"], timeout=20)
+            raise BackendError("Connection aborted by user.")
         _log_emit(emit, f"[sslvpn] Dialing {target} ...")
 
         deadline = time.time() + 35

@@ -1885,6 +1885,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
 
     def _bootstrap_failed(self, reason: str) -> bool:
         self._spawning_worker = False
+        self._aborting = False
         self._append_log(_("The helper could not be started: {detail}")
                          .format(detail=reason))
         if "polkit agent" in reason:
@@ -2327,6 +2328,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         server = getattr(self, "_last_connected_server", None) or self.selected or self.recommended
         protocol = getattr(self, "_last_connected_protocol", None)
         if server is None:
+            self._auto_reconnecting = False
             return
         if protocol is None:
             target_proto = Protocol.SSTP if sys.platform == "win32" else Protocol.SSLVP
