@@ -26,3 +26,4 @@ _internal/
 
 # Others
 others/
+.agents/

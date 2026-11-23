@@ -119,21 +119,22 @@ class OpenVpnBackend(Backend):
                 os.path.join(BASE_DIR, "openvpn.exe"),
             ]
             for p in bundled:
-                if os.path.exists(p):
+                if os.path.isfile(p):
                     return p
             for p in (r"C:\Program Files\OpenVPN\bin\openvpn.exe",
                       r"C:\Program Files (x86)\OpenVPN\bin\openvpn.exe"):
-                if os.path.exists(p):
+                if os.path.isfile(p):
                     return p
             found = shutil.which("openvpn")
-            if found:
+            if found and os.path.isfile(found):
                 return found
             for p in (r"C:\Program Files\OpenVPN Connect\OpenVPNConnect.exe",
                       r"C:\Program Files (x86)\OpenVPN Connect\OpenVPNConnect.exe"):
-                if os.path.exists(p):
+                if os.path.isfile(p):
                     return p
             return ""
-        return netutil.which("openvpn") or ""
+        which = netutil.which("openvpn")
+        return which if (which and os.path.isfile(which)) else ""
 
     # -- configuration ----------------------------------------------------
     @staticmethod
@@ -186,9 +187,7 @@ class OpenVpnBackend(Backend):
                           text, flags=re.M)
 
         auth_path = os.path.join(workdir, "auth.txt")
-        with open(auth_path, "w") as handle:
-            handle.write(f"{VPN_USERNAME}\n{VPN_PASSWORD}\n")
-        os.chmod(auth_path, 0o600)
+        self._safe_write_file(auth_path, f"{VPN_USERNAME}\n{VPN_PASSWORD}\n", 0o600)
 
         port = server.openvpn_udp if use_udp else server.openvpn_tcp
         if not port:
@@ -216,17 +215,40 @@ class OpenVpnBackend(Backend):
         text += "\npersist-tun\n"
 
         path = os.path.join(workdir, "client.ovpn")
-        with open(path, "w") as handle:
-            handle.write(text)
-        os.chmod(path, 0o600)
+        self._safe_write_file(path, text, 0o600)
         return path
+
+    @staticmethod
+    def _safe_write_file(path: str, content: str, mode: int = 0o600) -> None:
+        """Write file content with retries to tolerate transient Windows file locks."""
+        delays = (0.1, 0.25, 0.5, 0.0)
+        for attempt, delay in enumerate(delays):
+            try:
+                with open(path, "w") as handle:
+                    handle.write(content)
+                try:
+                    os.chmod(path, mode)
+                except Exception:
+                    pass
+                return
+            except (PermissionError, OSError):
+                if attempt >= len(delays) - 1:
+                    raise
+                time.sleep(delay)
 
     # -- connect / disconnect --------------------------------------------
     def connect(self, server: VpnServer, protocol: Protocol, emit: Emit,
                 workdir: str, timeout: int = 30, retries: int = 1) -> dict:
         self._abort_requested = False
-        config = self.build_config(server, workdir, emit)
         openvpn_bin = self._openvpn_bin() or "openvpn"
+        if not os.path.isabs(openvpn_bin):
+            resolved = shutil.which(openvpn_bin)
+            if resolved:
+                openvpn_bin = resolved
+        if not openvpn_bin or not os.path.isfile(openvpn_bin) or os.path.isdir(openvpn_bin):
+            raise BackendError("OpenVPN executable not found")
+
+        config = self.build_config(server, workdir, emit)
         if sys.platform == "win32" and self._is_connect(openvpn_bin):
             return self._connect_openvpn_connect(server, protocol, emit, workdir,
                                                  config, openvpn_bin, timeout=timeout)
@@ -451,9 +473,19 @@ class OpenVpnBackend(Backend):
         try:
             if sys.platform == "win32":
                 creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                               capture_output=True, timeout=5,
-                               creationflags=creation_flags)
+                try:
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                   capture_output=True, timeout=5,
+                                   creationflags=creation_flags)
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
             else:
                 proc.terminate()
                 proc.wait(timeout=10)
@@ -462,6 +494,13 @@ class OpenVpnBackend(Backend):
                 proc.kill()
             except Exception:                      # noqa: BLE001
                 pass
+        finally:
+            for stream in (getattr(proc, "stdout", None), getattr(proc, "stderr", None), getattr(proc, "stdin", None)):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
 
     def disconnect(self, info: dict, emit: Emit) -> None:
         detail = info.get("detail") if isinstance(info.get("detail"), dict) else {}
@@ -541,28 +580,53 @@ class SoftEtherBackend(Backend):
     def _run_commands(commands: List[str], timeout: int = 90) -> str:
         workdir = STATE_DIR
         os.makedirs(workdir, exist_ok=True)
-        cmd_file = os.path.join(workdir, "vpncmd.cmds")
-        out_file = os.path.join(workdir, "vpncmd.out")
-        with open(cmd_file, "w") as handle:
-            handle.write("\n".join(commands) + "\n")
-        # Truncate first: on a slow client (vpncmd can block while a
-        # session is negotiating) the stale file from a previous call
-        # must not be mistaken for the current result.
-        with open(out_file, "w") as handle:
-            handle.write("")
+        unique_id = f"{os.getpid()}_{threading.get_ident()}_{time.time_ns()}"
+        cmd_file = os.path.join(workdir, f"vpncmd_{unique_id}.cmds")
+        out_file = os.path.join(workdir, f"vpncmd_{unique_id}.out")
+        delays = (0.1, 0.25, 0.5, 0.0)
+        for attempt, delay in enumerate(delays):
+            try:
+                with open(cmd_file, "w") as handle:
+                    handle.write("\n".join(commands) + "\n")
+                # Truncate first: on a slow client (vpncmd can block while a
+                # session is negotiating) the stale file from a previous call
+                # must not be mistaken for the current result.
+                with open(out_file, "w") as handle:
+                    handle.write("")
+                break
+            except (PermissionError, OSError):
+                if attempt >= len(delays) - 1:
+                    raise
+                time.sleep(delay)
         try:
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
             subprocess.run(
                 [self_cmd(), "127.0.0.1", "/CLIENT", f"/IN:{cmd_file}",
                  f"/OUT:{out_file}"],
                 stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                timeout=timeout)
+                timeout=timeout, creationflags=creation_flags)
         except subprocess.TimeoutExpired:
             pass
+        out_content = ""
+        for attempt, delay in enumerate((0.1, 0.25, 0.0)):
+            try:
+                with open(out_file) as handle:
+                    out_content = handle.read()
+                break
+            except PermissionError:
+                if attempt >= 2:
+                    break
+                time.sleep(delay)
+            except OSError:
+                break
         try:
-            with open(out_file) as handle:
-                return handle.read()
-        except OSError:
-            return ""
+            if os.path.exists(cmd_file):
+                os.remove(cmd_file)
+            if os.path.exists(out_file):
+                os.remove(out_file)
+        except Exception:
+            pass
+        return out_content
 
     def _hard_start(self, emit: Emit) -> None:
         """Restart the client daemon with the TUN module available.
@@ -938,37 +1002,42 @@ def _remove_windows_vpn_pbk_entry(vpn_name: str) -> None:
             pass
 
 
-def _cleanup_windows_ras(vpn_name: str, target_ips: Optional[set] = None) -> None:
-    """Safely terminate stuck rasdial processes and cleanly remove the Windows VPN profile."""
+def _cleanup_windows_ras(vpn_name: str, target_ips: Optional[set] = None,
+                         active_proc: Optional[subprocess.Popen] = None) -> None:
+    """Safely terminate stuck rasdial process and cleanly remove the Windows VPN profile."""
     if sys.platform != "win32":
         return
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    names_to_clean = set(filter(None, [vpn_name, "VPNGate", "VPNGate2"]))
-    for name in names_to_clean:
-        try:
-            subprocess.run(["rasdial", name, "/DISCONNECT"],
-                           capture_output=True, text=True, timeout=5, creationflags=creation_flags)
-        except Exception:
-            pass
-        try:
-            subprocess.run(["rasphone", "-h", name],
-                           capture_output=True, text=True, timeout=5, creationflags=creation_flags)
-        except Exception:
-            pass
-        _remove_windows_vpn_pbk_entry(name)
-
+    name = vpn_name or "VPNGate"
     try:
-        subprocess.run(["taskkill", "/F", "/IM", "rasdial.exe"],
+        subprocess.run(["rasdial", name, "/DISCONNECT"],
                        capture_output=True, text=True, timeout=5, creationflags=creation_flags)
     except Exception:
         pass
+    try:
+        subprocess.run(["rasphone", "-h", name],
+                       capture_output=True, text=True, timeout=5, creationflags=creation_flags)
+    except Exception:
+        pass
+    _remove_windows_vpn_pbk_entry(name)
+
+    if active_proc is not None and getattr(active_proc, "pid", None):
+        try:
+            if active_proc.poll() is None:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(active_proc.pid)],
+                               capture_output=True, text=True, timeout=5, creationflags=creation_flags)
+                try:
+                    active_proc.wait(timeout=2)
+                except Exception:
+                    active_proc.kill()
+        except Exception:
+            pass
 
     try:
-        ps_cleanup = " ".join([
-            f"Get-VpnConnection -Name '{n}' -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue; "
-            f"Get-VpnConnection -Name '{n}' -AllUserConnection -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue;"
-            for n in names_to_clean
-        ])
+        ps_cleanup = (
+            f"Get-VpnConnection -Name '{name}' -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue; "
+            f"Get-VpnConnection -Name '{name}' -AllUserConnection -ErrorAction SilentlyContinue | Remove-VpnConnection -Force -ErrorAction SilentlyContinue;"
+        )
         subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cleanup],
                        capture_output=True, text=True, timeout=15, creationflags=creation_flags)
     except Exception:
@@ -1018,7 +1087,7 @@ class SstpBackend(Backend):
                                capture_output=True, timeout=5, creationflags=creation_flags)
             except Exception:
                 pass
-            _cleanup_windows_ras(vpn_name, target_ips)
+            _cleanup_windows_ras(vpn_name, target_ips, active_proc=proc)
         else:
             netutil.run(["pkill", "-f", "sstpc"], timeout=10)
 
@@ -1087,16 +1156,29 @@ class SstpBackend(Backend):
             f"-SplitTunneling:$false -Force"
         )
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        proc = None
         try:
-            res = subprocess.run(
+            proc = subprocess.Popen(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_add],
-                capture_output=True, text=True, timeout=45, creationflags=creation_flags
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                creationflags=creation_flags
             )
-            if res.returncode != 0:
-                err = res.stderr.strip() or res.stdout.strip()
-                raise BackendError(f"Failed to create Windows VPN profile for MS-SSTP: {err}")
+            self._active_proc = proc
+            out, err = proc.communicate(timeout=45)
+            if self._abort_requested:
+                raise BackendError("Connection aborted by user.")
+            if proc.returncode != 0:
+                err_msg = (err or "").strip() or (out or "").strip()
+                raise BackendError(f"Failed to create Windows VPN profile for MS-SSTP: {err_msg}")
         except subprocess.TimeoutExpired:
+            if proc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
             raise BackendError("Windows PowerShell timed out while creating the VPN profile. System may be slow or overloaded.")
+        finally:
+            self._active_proc = None
 
         self._configure_windows_vpn_pbk(vpn_name)
 
@@ -1206,7 +1288,7 @@ class SstpBackend(Backend):
                 time.sleep(1.5)
         else:
             if not self._abort_requested:
-                _cleanup_windows_ras(vpn_name, target_ips)
+                _cleanup_windows_ras(vpn_name, target_ips, active_proc=self._active_proc)
                 raise BackendError(f"MS-SSTP connection failed: {last_error}")
 
         if self._abort_requested:
@@ -1378,7 +1460,7 @@ class SstpBackend(Backend):
             if not target_ips and info.get("ip"):
                 target_ips = {info["ip"]}
             _log_emit(emit, f"[sstp] Disconnecting Windows RAS connection {vpn_name} ...")
-            _cleanup_windows_ras(vpn_name, target_ips)
+            _cleanup_windows_ras(vpn_name, target_ips, active_proc=info.get("process"))
             _log_emit(emit, "Windows MS-SSTP disconnected.")
             return
         started = time.monotonic()
@@ -1452,7 +1534,7 @@ class L2tpBackend(Backend):
                                capture_output=True, timeout=5, creationflags=creation_flags)
             except Exception:
                 pass
-            _cleanup_windows_ras(vpn_name, target_ips)
+            _cleanup_windows_ras(vpn_name, target_ips, active_proc=proc)
         else:
             netutil.run(["pkill", "-f", "xl2tpd"], timeout=10)
             self._ipsec_down()
@@ -1485,16 +1567,29 @@ class L2tpBackend(Backend):
             f"-SplitTunneling:$false -Force"
         )
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        proc = None
         try:
-            res = subprocess.run(
+            proc = subprocess.Popen(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_add],
-                capture_output=True, text=True, timeout=45, creationflags=creation_flags
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                creationflags=creation_flags
             )
-            if res.returncode != 0:
-                err = res.stderr.strip() or res.stdout.strip()
-                raise BackendError(f"Failed to create Windows VPN profile for L2TP/IPsec: {err}")
+            self._active_proc = proc
+            out, err = proc.communicate(timeout=45)
+            if self._abort_requested:
+                raise BackendError("Connection aborted by user.")
+            if proc.returncode != 0:
+                err_msg = (err or "").strip() or (out or "").strip()
+                raise BackendError(f"Failed to create Windows VPN profile for L2TP/IPsec: {err_msg}")
         except subprocess.TimeoutExpired:
+            if proc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
             raise BackendError("Windows PowerShell timed out while creating the VPN profile. System may be slow or overloaded.")
+        finally:
+            self._active_proc = None
 
         SstpBackend._configure_windows_vpn_pbk(vpn_name)
 
@@ -1604,7 +1699,7 @@ class L2tpBackend(Backend):
                 time.sleep(1.5)
         else:
             if not self._abort_requested:
-                _cleanup_windows_ras(vpn_name, target_ips)
+                _cleanup_windows_ras(vpn_name, target_ips, active_proc=self._active_proc)
                 raise BackendError(f"L2TP/IPsec connection failed: {last_error}")
 
         if self._abort_requested:
@@ -1994,7 +2089,7 @@ class L2tpBackend(Backend):
             if not target_ips and info.get("ip"):
                 target_ips = {info["ip"]}
             _log_emit(emit, f"[l2tp] Disconnecting Windows RAS connection {vpn_name} ...")
-            _cleanup_windows_ras(vpn_name, target_ips)
+            _cleanup_windows_ras(vpn_name, target_ips, active_proc=info.get("process"))
             _log_emit(emit, "Windows L2TP/IPsec disconnected.")
             return
         started = time.monotonic()

@@ -36,8 +36,9 @@ class Worker:
         self.protocol: Optional[Protocol] = None
         self._connecting_backend = None
         self._connect_thread: Optional[threading.Thread] = None
-        self._connect_lock = threading.Lock()
+        self._connect_lock = threading.RLock()
         self._is_connecting = False
+        self._active_attempt_id: int = 0
         if sys.platform != "win32" and hasattr(os, "geteuid") and os.geteuid() == 0:
             self.workdir = "/run/vpngate-client"
         else:
@@ -112,7 +113,9 @@ class Worker:
             _emit({"event": "error", "message": f"Unknown command: {action}"})
 
     def do_abort_or_disconnect(self) -> None:
+        old_thread = None
         with self._connect_lock:
+            self._active_attempt_id += 1
             if self._is_connecting:
                 self._log("Cancelling in-progress connection attempt ...")
                 if self._connecting_backend is not None:
@@ -122,13 +125,25 @@ class Worker:
                         self._log(f"Error aborting backend: {exc}")
                 self._is_connecting = False
                 self._connecting_backend = None
+                if self._connect_thread is not None and self._connect_thread.is_alive():
+                    old_thread = self._connect_thread
+                    self._connect_thread = None
                 _emit({"event": "state", "state": "disconnected", "message": "Connection cancelled."})
-                return
+            elif self._connect_thread is not None and self._connect_thread.is_alive():
+                old_thread = self._connect_thread
+                self._connect_thread = None
+
+        if old_thread is not None:
+            old_thread.join(timeout=2.0)
 
         self.do_disconnect()
 
     def start_connect(self, command: dict) -> None:
+        old_thread = None
         with self._connect_lock:
+            self._active_attempt_id += 1
+            attempt_id = self._active_attempt_id
+
             if self._is_connecting:
                 if self._connecting_backend is not None:
                     try:
@@ -136,9 +151,21 @@ class Worker:
                     except Exception:
                         pass
                 self._is_connecting = False
+                self._connecting_backend = None
+
+            if self._connect_thread is not None and self._connect_thread.is_alive():
+                old_thread = self._connect_thread
+                self._connect_thread = None
 
             if self.connection is not None:
-                self.do_disconnect()
+                self.do_disconnect(emit_state=False)
+
+        if old_thread is not None:
+            old_thread.join(timeout=2.0)
+
+        with self._connect_lock:
+            if self._active_attempt_id != attempt_id:
+                return
 
             try:
                 protocol = Protocol(command.get("protocol", "openvpn"))
@@ -185,20 +212,22 @@ class Worker:
 
             thread = threading.Thread(
                 target=self._connect_thread_worker,
-                args=(backend, server, protocol, timeout, retries),
+                args=(backend, server, protocol, timeout, retries, attempt_id),
                 daemon=True,
             )
             self._connect_thread = thread
             thread.start()
 
     def _connect_thread_worker(self, backend, server: VpnServer, protocol: Protocol,
-                               timeout: int, retries: int) -> None:
+                               timeout: int, retries: int, attempt_id: int) -> None:
         try:
             info = backend.connect(server, protocol, self._log, self.workdir,
                                    timeout=timeout, retries=retries)
         except BackendError as exc:
+            if self._active_attempt_id != attempt_id:
+                return
             with self._connect_lock:
-                if not self._is_connecting or self._connecting_backend is not backend:
+                if self._active_attempt_id != attempt_id or not self._is_connecting:
                     return
                 self._is_connecting = False
                 self._connecting_backend = None
@@ -206,8 +235,10 @@ class Worker:
             _emit({"event": "state", "state": "disconnected"})
             return
         except Exception as exc:                  # noqa: BLE001
+            if self._active_attempt_id != attempt_id:
+                return
             with self._connect_lock:
-                if not self._is_connecting or self._connecting_backend is not backend:
+                if self._active_attempt_id != attempt_id or not self._is_connecting:
                     return
                 self._is_connecting = False
                 self._connecting_backend = None
@@ -216,8 +247,15 @@ class Worker:
             _emit({"event": "state", "state": "disconnected"})
             return
 
+        if self._active_attempt_id != attempt_id:
+            try:
+                backend.disconnect(info, self._log)
+            except Exception:
+                pass
+            return
+
         with self._connect_lock:
-            if not self._is_connecting or self._connecting_backend is not backend:
+            if self._active_attempt_id != attempt_id:
                 try:
                     backend.disconnect(info, self._log)
                 except Exception:
@@ -241,22 +279,26 @@ class Worker:
         _emit({"event": "state", "state": "connected", "protocol": protocol.value,
                "message": f"Connected to {server.hostname} via {backend.name}"})
 
-    def do_disconnect(self) -> None:
+    def do_disconnect(self, emit_state: bool = True, expected_conn: Optional[dict] = None) -> None:
         self._win_vpn_missed = 0
         with self._connect_lock:
             conn = self.connection
             backend = self.backend
+            if expected_conn is not None and conn is not expected_conn:
+                return
             self.connection = None
             self.backend = None
             self.protocol = None
         if conn is None or backend is None:
-            _emit({"event": "state", "state": "disconnected"})
+            if emit_state:
+                _emit({"event": "state", "state": "disconnected"})
             return
         try:
             backend.disconnect(conn, self._log)
         except Exception as exc:                  # noqa: BLE001
             self._log(f"Error while disconnecting: {exc}")
-        _emit({"event": "state", "state": "disconnected"})
+        if emit_state:
+            _emit({"event": "state", "state": "disconnected"})
 
     def do_status(self) -> None:
         with self._connect_lock:

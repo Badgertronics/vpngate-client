@@ -90,6 +90,7 @@ def build_pyinstaller(build_dir: Path, dist_dir: Path) -> Path:
     hooks_dir = ROOT / "scripts" / "hooks"
     icon_path = APP_DIR / "icons" / "vpngate.ico"
     icon_args = ["--icon", str(icon_path)] if icon_path.exists() else []
+    admin_args = ["--uac-admin"] if sys.platform == "win32" else []
 
     print("==> Building GUI executable with PyInstaller...")
     gui_cmd = [
@@ -100,6 +101,7 @@ def build_pyinstaller(build_dir: Path, dist_dir: Path) -> Path:
         "--noconsole",
         "--name", "vpngate-gui",
         *icon_args,
+        *admin_args,
         "--distpath", str(bundle_dir),
         "--workpath", str(build_dir / "build-gui"),
         "--additional-hooks-dir", str(hooks_dir),
@@ -115,6 +117,7 @@ def build_pyinstaller(build_dir: Path, dist_dir: Path) -> Path:
         "--clean",
         "--name", "vpngate-worker",
         *icon_args,
+        *admin_args,
         "--distpath", str(bundle_dir),
         "--workpath", str(build_dir / "build-worker"),
         str(APP_DIR / "worker_main.py"),
