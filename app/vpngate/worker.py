@@ -16,7 +16,7 @@ import traceback
 from typing import Optional
 
 from . import netutil
-from .backends import BACKENDS, BackendError
+from .backends import BACKENDS, Backend, BackendError
 from .config import STATE_DIR
 from .models import Protocol, VpnServer
 
@@ -29,6 +29,12 @@ def _emit(payload: dict) -> None:
         sys.stdout.flush()
 
 
+def _emit_for(attempt_id: Optional[int], payload: dict) -> None:
+    if attempt_id is not None and "attempt_id" not in payload:
+        payload = dict(payload, attempt_id=attempt_id)
+    _emit(payload)
+
+
 class Worker:
     def __init__(self) -> None:
         self.connection: Optional[dict] = None
@@ -39,6 +45,7 @@ class Worker:
         self._connect_lock = threading.RLock()
         self._is_connecting = False
         self._active_attempt_id: int = 0
+        self._client_attempt_id: Optional[int] = None
         if sys.platform != "win32" and hasattr(os, "geteuid") and os.geteuid() == 0:
             self.workdir = "/run/vpngate-client"
         else:
@@ -56,12 +63,14 @@ class Worker:
                 self._win_vpn_missed = 0
                 continue
 
+            client_aid = conn.get("_client_attempt_id")
+
             # 1. Process-based VPN check (OpenVPN / sstpc / xl2tpd)
             proc = conn.get("process")
             if proc is not None and proc.poll() is not None:
                 code = proc.returncode
                 self._log(f"Tunnel process terminated (exit code {code}).")
-                _emit({"event": "error", "message": f"VPN tunnel process stopped (code {code})."})
+                _emit_for(client_aid, {"event": "error", "message": f"VPN tunnel process stopped (code {code})."})
                 self.do_disconnect(expected_conn=conn)
                 continue
 
@@ -77,7 +86,7 @@ class Worker:
                         if self._win_vpn_missed >= 2:
                             self._win_vpn_missed = 0
                             self._log(f"Windows VPN '{win_vpn}' connection dropped.")
-                            _emit({"event": "error", "message": f"Windows VPN '{win_vpn}' connection dropped."})
+                            _emit_for(client_aid, {"event": "error", "message": f"Windows VPN '{win_vpn}' connection dropped."})
                             self.do_disconnect(expected_conn=conn)
                     else:
                         self._win_vpn_missed = 0
@@ -102,7 +111,7 @@ class Worker:
         if action == "connect":
             self.start_connect(command)
         elif action in ("disconnect", "abort"):
-            self.do_abort_or_disconnect()
+            self.do_abort_or_disconnect(command)
         elif action == "status":
             self.do_status()
         elif action == "quit":
@@ -112,10 +121,14 @@ class Worker:
         else:
             _emit({"event": "error", "message": f"Unknown command: {action}"})
 
-    def do_abort_or_disconnect(self) -> None:
+    def do_abort_or_disconnect(self, command: Optional[dict] = None) -> None:
         old_thread = None
         was_connecting = False
+        cmd_aid = command.get("attempt_id") if isinstance(command, dict) else None
         with self._connect_lock:
+            if cmd_aid is not None and self._client_attempt_id is not None and cmd_aid < self._client_attempt_id:
+                return
+            cancel_aid = cmd_aid if cmd_aid is not None else self._client_attempt_id
             self._active_attempt_id += 1
             if self._is_connecting:
                 was_connecting = True
@@ -130,7 +143,7 @@ class Worker:
                 if self._connect_thread is not None and self._connect_thread.is_alive():
                     old_thread = self._connect_thread
                     self._connect_thread = None
-                _emit({"event": "state", "state": "disconnected", "message": "Connection cancelled."})
+                _emit_for(cancel_aid, {"event": "state", "state": "disconnected", "message": "Connection cancelled."})
             elif self._connect_thread is not None and self._connect_thread.is_alive():
                 old_thread = self._connect_thread
                 self._connect_thread = None
@@ -143,9 +156,12 @@ class Worker:
     def start_connect(self, command: dict) -> None:
         old_thread = None
         has_old_conn = False
+        client_attempt_id = command.get("attempt_id")
         with self._connect_lock:
             self._active_attempt_id += 1
             attempt_id = self._active_attempt_id
+            self._client_attempt_id = client_attempt_id
+            self._win_vpn_missed = 0
 
             if self._is_connecting:
                 if self._connecting_backend is not None:
@@ -176,15 +192,19 @@ class Worker:
             try:
                 protocol = Protocol(command.get("protocol", "openvpn"))
             except ValueError:
-                _emit({"event": "error", "message": "Unsupported protocol."})
-                _emit({"event": "state", "state": "disconnected"})
+                _emit_for(client_attempt_id, {"event": "error", "message": "Unsupported protocol."})
+                _emit_for(client_attempt_id, {"event": "state", "state": "disconnected"})
                 return
 
-            backend = BACKENDS.get(protocol)
-            if backend is None:
-                _emit({"event": "error", "message": "No backend for this protocol."})
-                _emit({"event": "state", "state": "disconnected"})
+            template_backend = BACKENDS.get(protocol)
+            if template_backend is None:
+                _emit_for(client_attempt_id, {"event": "error", "message": "No backend for this protocol."})
+                _emit_for(client_attempt_id, {"event": "state", "state": "disconnected"})
                 return
+
+            # Instantiate a fresh backend instance per connect attempt so any slow-exiting
+            # previous connect thread cannot mutate _abort_requested or _active_proc.
+            backend = type(template_backend)() if isinstance(template_backend, Backend) else template_backend
 
             if not backend.available():
                 if sys.platform == "win32":
@@ -200,8 +220,8 @@ class Worker:
                         msg = f"The {backend.name} client is not installed."
                 else:
                     msg = f"The {backend.name} client is not installed."
-                _emit({"event": "error", "message": msg})
-                _emit({"event": "state", "state": "disconnected"})
+                _emit_for(client_attempt_id, {"event": "error", "message": msg})
+                _emit_for(client_attempt_id, {"event": "state", "state": "disconnected"})
                 return
 
             server = self._server_from(command.get("server", {}))
@@ -211,21 +231,24 @@ class Worker:
             self._is_connecting = True
             self._connecting_backend = backend
 
-            _emit({"event": "state", "state": "connecting",
-                   "protocol": protocol.value,
-                   "message": f"Connecting to {server.hostname} ({server.ip}) "
-                              f"using {backend.name} ..."})
+            _emit_for(client_attempt_id, {
+                "event": "state", "state": "connecting",
+                "protocol": protocol.value,
+                "message": f"Connecting to {server.hostname} ({server.ip}) "
+                           f"using {backend.name} ...",
+            })
 
             thread = threading.Thread(
                 target=self._connect_thread_worker,
-                args=(backend, server, protocol, timeout, retries, attempt_id),
+                args=(backend, server, protocol, timeout, retries, attempt_id, client_attempt_id),
                 daemon=True,
             )
             self._connect_thread = thread
             thread.start()
 
     def _connect_thread_worker(self, backend, server: VpnServer, protocol: Protocol,
-                               timeout: int, retries: int, attempt_id: int) -> None:
+                               timeout: int, retries: int, attempt_id: int,
+                               client_attempt_id: Optional[int] = None) -> None:
         try:
             info = backend.connect(server, protocol, self._log, self.workdir,
                                    timeout=timeout, retries=retries)
@@ -237,8 +260,8 @@ class Worker:
                     return
                 self._is_connecting = False
                 self._connecting_backend = None
-            _emit({"event": "error", "message": str(exc)})
-            _emit({"event": "state", "state": "disconnected"})
+            _emit_for(client_attempt_id, {"event": "error", "message": str(exc)})
+            _emit_for(client_attempt_id, {"event": "state", "state": "disconnected"})
             return
         except Exception as exc:                  # noqa: BLE001
             if self._active_attempt_id != attempt_id:
@@ -249,8 +272,8 @@ class Worker:
                 self._is_connecting = False
                 self._connecting_backend = None
             self._log(traceback.format_exc())
-            _emit({"event": "error", "message": f"{type(exc).__name__}: {exc}"})
-            _emit({"event": "state", "state": "disconnected"})
+            _emit_for(client_attempt_id, {"event": "error", "message": f"{type(exc).__name__}: {exc}"})
+            _emit_for(client_attempt_id, {"event": "state", "state": "disconnected"})
             return
 
         if self._active_attempt_id != attempt_id:
@@ -271,6 +294,7 @@ class Worker:
             self._connecting_backend = None
 
             info["started_at"] = time.time()
+            info["_client_attempt_id"] = client_attempt_id
             self.connection = info
             self.backend = backend
             self.protocol = protocol
@@ -290,9 +314,11 @@ class Worker:
                     pass
                 return
             info["external_ip"] = external
-            _emit({"event": "connected", "info": _jsonable(info)})
-            _emit({"event": "state", "state": "connected", "protocol": protocol.value,
-                   "message": f"Connected to {server.hostname} via {backend.name}"})
+            _emit_for(client_attempt_id, {"event": "connected", "info": _jsonable(info)})
+            _emit_for(client_attempt_id, {
+                "event": "state", "state": "connected", "protocol": protocol.value,
+                "message": f"Connected to {server.hostname} via {backend.name}",
+            })
 
     def do_disconnect(self, emit_state: bool = True, expected_conn: Optional[dict] = None) -> None:
         self._win_vpn_missed = 0
@@ -301,35 +327,42 @@ class Worker:
             backend = self.backend
             if expected_conn is not None and conn is not expected_conn:
                 return
+            conn_client_aid = conn.get("_client_attempt_id") if conn else self._client_attempt_id
+            seq_at_start = self._active_attempt_id
             self.connection = None
             self.backend = None
             self.protocol = None
         if conn is None or backend is None:
             if emit_state:
-                _emit({"event": "state", "state": "disconnected"})
+                _emit_for(conn_client_aid, {"event": "state", "state": "disconnected"})
             return
         try:
             backend.disconnect(conn, self._log)
         except Exception as exc:                  # noqa: BLE001
             self._log(f"Error while disconnecting: {exc}")
         if emit_state:
-            _emit({"event": "state", "state": "disconnected"})
+            with self._connect_lock:
+                # Do not emit stale disconnected if a newer attempt or connection replaced this one.
+                if self._active_attempt_id != seq_at_start or self._is_connecting or self.connection is not None:
+                    return
+            _emit_for(conn_client_aid, {"event": "state", "state": "disconnected"})
 
     def do_status(self) -> None:
         with self._connect_lock:
             conn = self.connection
             is_connecting = self._is_connecting
+            client_aid = conn.get("_client_attempt_id") if conn else self._client_attempt_id
         if is_connecting:
-            _emit({"event": "state", "state": "connecting"})
+            _emit_for(client_aid, {"event": "state", "state": "connecting"})
         elif conn is None:
-            _emit({"event": "state", "state": "disconnected"})
+            _emit_for(client_aid, {"event": "state", "state": "disconnected"})
         else:
-            _emit({"event": "connected", "info": _jsonable(conn)})
-            _emit({"event": "state", "state": "connected"})
+            _emit_for(client_aid, {"event": "connected", "info": _jsonable(conn)})
+            _emit_for(client_aid, {"event": "state", "state": "connected"})
 
 
 def _jsonable(info: dict) -> dict:
-    out = {k: v for k, v in info.items() if k != "process"}
+    out = {k: v for k, v in info.items() if k != "process" and not k.startswith("_")}
     return out
 
 

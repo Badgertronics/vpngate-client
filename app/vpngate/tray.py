@@ -35,6 +35,7 @@ class _Win32Tray:
         self._on_action = on_action
         self._hwnd: Optional[int] = None
         self._nid = None
+        self._nid_lock = threading.Lock()
         self._current_hicon = None
         self._flags = {"connect_enabled": True, "disconnect_enabled": False}
         self._available = False
@@ -334,11 +335,17 @@ class _Win32Tray:
             "error": "VPN Gate Client - error",
         }
         text = mapping.get(status, mapping["idle"])
-        self._nid.szTip = text[:127]
-        if not self._nid.hIcon and self._current_hicon:
-            self._nid.hIcon = self._current_hicon
-        NIM_MODIFY = 0x00000001
-        self._shell32.Shell_NotifyIconW(NIM_MODIFY, self._ctypes.byref(self._nid))
+        with self._nid_lock:
+            # Never keep NIF_INFO set when modifying tooltip, otherwise Windows
+            # re-displays the previous balloon notification on state updates.
+            self._nid.uFlags = 1 | 2 | 4
+            self._nid.szTip = text[:127]
+            self._nid.szInfoTitle = ""
+            self._nid.szInfo = ""
+            if not self._nid.hIcon and self._current_hicon:
+                self._nid.hIcon = self._current_hicon
+            NIM_MODIFY = 0x00000001
+            self._shell32.Shell_NotifyIconW(NIM_MODIFY, self._ctypes.byref(self._nid))
 
     def notify(self, title: str, message: str, level: str = "info") -> bool:
         if not self._available or not self._hwnd or not self._nid:
@@ -359,13 +366,18 @@ class _Win32Tray:
             NIIF_WARNING = 0x00000002
             flag = NIIF_WARNING if level in ("warning", "error", "alarm") else NIIF_INFO
 
-            self._nid.uFlags = 1 | 2 | 4 | NIF_INFO
-            self._nid.szInfoTitle = title[:63]
-            self._nid.szInfo = message[:255]
-            self._nid.dwInfoFlags = flag
-            NIM_MODIFY = 0x00000001
-            ret = self._shell32.Shell_NotifyIconW(NIM_MODIFY, self._ctypes.byref(self._nid))
-            return bool(ret)
+            with self._nid_lock:
+                self._nid.uFlags = 1 | 2 | 4 | NIF_INFO
+                self._nid.szInfoTitle = title[:63]
+                self._nid.szInfo = message[:255]
+                self._nid.dwInfoFlags = flag
+                NIM_MODIFY = 0x00000001
+                ret = self._shell32.Shell_NotifyIconW(NIM_MODIFY, self._ctypes.byref(self._nid))
+                # Clear balloon fields immediately so later icon/tooltip updates cannot replay it.
+                self._nid.uFlags = 1 | 2 | 4
+                self._nid.szInfoTitle = ""
+                self._nid.szInfo = ""
+                return bool(ret)
         except Exception:
             return False
 
@@ -501,6 +513,7 @@ def win32_standalone_notify(title: str, message: str, level: str = "info") -> bo
             try:
                 shell32.Shell_NotifyIconW(2, ctypes.byref(nid))
                 user32.DestroyWindow(hwnd)
+                _ = wndproc_ptr
                 if hicon and int(hicon) > 1:
                     user32.DestroyIcon(hicon)
             except Exception:

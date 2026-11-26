@@ -44,9 +44,12 @@ from vpngate.backends import (
     OpenVpnBackend,
     SoftEtherBackend,
     SstpBackend,
+    _claim_ras_profile_owner,
+    _claim_ras_route_owner,
     _cleanup_windows_ras,
 )
 from vpngate.models import Protocol, VpnServer
+from vpngate.tray import _Win32Tray
 from vpngate.ui import VpnGateWindow
 from vpngate.worker import Worker
 
@@ -220,6 +223,75 @@ class TestWorkerEdgeCases:
             # Final state in worker must not be connected
             assert worker.connection is None
 
+    def test_worker_uses_fresh_backend_instance_per_attempt(self):
+        """Each start_connect must allocate an isolated Backend instance so old threads cannot tamper with _abort_requested."""
+        worker = Worker()
+        template = OpenVpnBackend()
+        captured_backends = []
+
+        def fake_thread_worker(backend, *args, **kwargs):
+            captured_backends.append(backend)
+
+        with mock.patch("vpngate.worker.BACKENDS", {Protocol.OPENVPN: template}), \
+             mock.patch.object(OpenVpnBackend, "available", return_value=True), \
+             mock.patch.object(worker, "_connect_thread_worker", side_effect=fake_thread_worker), \
+             mock.patch("vpngate.worker._emit"):
+            worker.start_connect({"cmd": "connect", "protocol": "openvpn", "server": {"hostname": "r1", "ip": "1.1.1.1"}, "attempt_id": 1})
+            time.sleep(0.05)
+            worker.start_connect({"cmd": "connect", "protocol": "openvpn", "server": {"hostname": "r2", "ip": "2.2.2.2"}, "attempt_id": 2})
+            time.sleep(0.05)
+
+        assert len(captured_backends) == 2
+        b1, b2 = captured_backends
+        assert b1 is not b2
+        assert b1 is not template
+        b1._abort_requested = True
+        assert b2._abort_requested is False
+
+    def test_worker_delayed_monitor_disconnect_does_not_emit_after_new_connect(self):
+        """If monitor do_disconnect runs slowly while a new attempt starts, it must not emit stale state: disconnected."""
+        worker = Worker()
+        old_backend = mock.MagicMock()
+        conn1 = {"server": "old_relay", "process": None, "_client_attempt_id": 1}
+        worker.connection = conn1
+        worker.backend = old_backend
+        worker.protocol = Protocol.OPENVPN
+        worker._active_attempt_id = 1
+
+        def slow_disconnect(conn, log_fn):
+            # Simulate a new connection attempt starting while old backend.disconnect is still cleaning up
+            with worker._connect_lock:
+                worker._active_attempt_id += 1
+                worker._is_connecting = True
+
+        old_backend.disconnect.side_effect = slow_disconnect
+
+        with mock.patch("vpngate.worker._emit") as mock_emit:
+            worker.do_disconnect(emit_state=True, expected_conn=conn1)
+            disconnected_emits = [
+                call[0][0] for call in mock_emit.call_args_list
+                if call[0][0].get("event") == "state" and call[0][0].get("state") == "disconnected"
+            ]
+            assert len(disconnected_emits) == 0
+
+    def test_worker_ignores_stale_abort_command_with_older_attempt_id(self):
+        """Worker must ignore abort/disconnect commands whose attempt_id is older than active _client_attempt_id."""
+        worker = Worker()
+        mock_backend = mock.MagicMock()
+        mock_backend.available.return_value = True
+        worker._is_connecting = True
+        worker._connecting_backend = mock_backend
+        worker._active_attempt_id = 5
+        worker._client_attempt_id = 5
+
+        with mock.patch("vpngate.worker._emit"):
+            worker.handle({"cmd": "abort", "attempt_id": 4})
+
+        # Active attempt 5 must NOT have been aborted
+        mock_backend.abort.assert_not_called()
+        assert worker._is_connecting is True
+        assert worker._active_attempt_id == 5
+
 
 # ============================================================================
 # 2. UI Edge Cases: Auto-Reconnect, Abort Button, Tray Actions & Latch
@@ -237,6 +309,16 @@ class TestUiEdgeCases:
         win._auto_reconnecting = False
         win._auto_reconnect_attempt = 0
         win._auto_reconnect_timer_id = None
+        win._client_attempt_id = 0
+        win._connection_epoch = 0
+        win._watchdog_in_flight = False
+        win._watchdog_last_check = 0.0
+        win._watchdog_failures = 0
+        win._has_logged_first_probe = False
+        win._last_connectivity_log_time = 0.0
+        win.connectivity_targets = ["https://1.1.1.1"]
+        win.connectivity_target_states = {"https://1.1.1.1": True}
+        win.connected_info = None
         win._spawning_worker = False
         win._pending = None
         win._sudo_password = None
@@ -255,6 +337,10 @@ class TestUiEdgeCases:
         win.tray = mock.MagicMock()
         win.title_widget = mock.MagicMock()
         win.title_widget.props = mock.MagicMock()
+        for chip_name in ("chip_server", "chip_tunnel", "chip_public", "chip_iface", "chip_uptime"):
+            chip = mock.MagicMock()
+            chip.props = mock.MagicMock()
+            setattr(win, chip_name, chip)
         win._auth_dialog = None
 
         win._hide_chips = mock.MagicMock()
@@ -459,6 +545,95 @@ class TestUiEdgeCases:
             assert win._auto_reconnecting is False
             assert win._auto_reconnect_attempt == 0
 
+    def test_auto_reconnect_countdown_shows_stop_button_and_allows_abort(self):
+        """During auto-reconnect countdown, connect_btn must show 'Stop', _can_connect() is False, and clicking cancels it."""
+        win = self._create_mock_window()
+        win.state = "connected"
+        win._notified_connected = True
+        win._dispatch_event({"event": "error", "message": "Drop"})
+
+        scheduled_callbacks = []
+        with mock.patch("gi.repository.GLib.timeout_add_seconds", side_effect=lambda d, cb: (scheduled_callbacks.append(cb), 123)[1]):
+            win._handle_state({"state": "disconnected"})
+
+        assert win._auto_reconnecting is True
+        assert win._can_connect() is False
+        assert win.connect_btn.props.label == "Stop"
+        win.connect_btn.set_sensitive.assert_called_with(True)
+        win.header_spinner.set_visible.assert_called_with(True)
+        win.tray.set_menu.assert_called_with(connect_enabled=False, disconnect_enabled=True)
+
+        # User clicks primary button (currently labeled "Stop") during countdown
+        win._on_connect_clicked()
+
+        assert win._auto_reconnecting is False
+        assert win._auto_reconnect_timer_id is None
+        assert win._auto_reconnect_attempt == 0
+        assert win.state == "idle"
+        assert win.connect_btn.props.label == "Connect"
+        win._set_state.assert_called_with("idle", "Connection attempt stopped.")
+
+    def test_stale_attempt_events_ignored_after_new_connect(self):
+        """Stale aborted/failed events from an older attempt_id must not trigger error/disconnected after new connect."""
+        win = self._create_mock_window()
+        server = VpnServer()
+        server.openvpn_udp = 1194
+
+        # Connect attempt 1
+        win._connect(server, Protocol.OPENVPN)
+        aid1 = win._client_attempt_id
+        assert aid1 == 1
+
+        # Connect attempt 2 immediately
+        win._connect(server, Protocol.OPENVPN)
+        aid2 = win._client_attempt_id
+        assert aid2 == 2
+
+        # Attempt 2 establishes connection
+        info2 = {"server": "relay2", "ip": "2.2.2.2", "protocol": "openvpn"}
+        win._dispatch_event({"event": "connected", "info": info2, "attempt_id": aid2})
+        win._dispatch_event({"event": "state", "state": "connected", "attempt_id": aid2})
+        assert win.state == "connected"
+        win.notify_system.reset_mock()
+        win.toast.reset_mock()
+
+        # Late events from Attempt 1 arrive ("Connection aborted by user." + "disconnected")
+        win._dispatch_event({"event": "error", "message": "Connection aborted by user.", "attempt_id": aid1})
+        win._dispatch_event({"event": "state", "state": "disconnected", "attempt_id": aid1})
+
+        # Must remain connected with zero error/disconnect notifications!
+        assert win.state == "connected"
+        assert win.connected_info is info2
+        win.notify_system.assert_not_called()
+        win.toast.assert_not_called()
+
+    def test_stale_watchdog_probe_ignored_after_session_change(self):
+        """A slow watchdog probe from Session 1 failing after Session 2 connects must not disconnect Session 2."""
+        win = self._create_mock_window()
+        win.state = "connected"
+        win._notified_connected = True
+        win.settings["watchdog_threshold"] = 1
+        win._handle_connected({"server": "relay1", "ip": "1.1.1.1"})
+
+        captured_probes = []
+        with mock.patch("vpngate.ui.probe_target", return_value=False), \
+             mock.patch("gi.repository.GLib.idle_add", side_effect=lambda fn, *a: captured_probes.append(fn)):
+            win._run_watchdog_probe(win._connection_epoch)
+
+        # Session 1 drops and Session 2 connects cleanly before Session 1's probe result is processed!
+        win._handle_connected({"server": "relay2", "ip": "2.2.2.2"})
+        assert win._watchdog_failures == 0
+
+        # Deliver stale probe completion from Session 1
+        assert len(captured_probes) == 1
+        captured_probes[0]()
+
+        # Session 2 must stay completely unaffected
+        assert win.state == "connected"
+        assert win._watchdog_failures == 0
+        win._send.assert_not_called()
+        win.toast.assert_not_called()
+
 
 # ============================================================================
 # 3. Backends: Process Termination, Safe File Writes & RAS Cleanup
@@ -647,3 +822,67 @@ class TestBackendsEdgeCases:
             with pytest.raises(BackendError, match="Connection aborted by user"):
                 l2tp._connect_windows(server, Protocol.L2TP, mock.MagicMock(), "/tmp", 30, 1)
             assert mock_clean_l2tp.called
+
+    def test_win32_tray_set_state_clears_nif_info_flag(self):
+        """Win32 tray set_state must strip NIF_INFO and clear szInfo so old balloons never replay on connect."""
+        tray = object.__new__(_Win32Tray)
+        tray._available = True
+        tray._hwnd = 12345
+        tray._current_hicon = 99
+        tray._nid = mock.MagicMock()
+        tray._nid.hIcon = 99
+        tray._nid_lock = threading.Lock()
+        tray._user32 = mock.MagicMock()
+        tray._ctypes = mock.MagicMock()
+        tray._shell32 = mock.MagicMock()
+        tray._shell32.Shell_NotifyIconW.return_value = 1
+
+        observed_flags = []
+        observed_infos = []
+        def capture_modify(msg, ptr):
+            observed_flags.append(tray._nid.uFlags)
+            observed_infos.append(tray._nid.szInfo)
+            return 1
+
+        tray._shell32.Shell_NotifyIconW.side_effect = capture_modify
+
+        tray.notify("VPN Disconnected", "Connection aborted by user.", level="alarm")
+        # When notify sends balloon, NIF_INFO (0x10) is set, then cleared right after
+        assert observed_flags[0] == (1 | 2 | 4 | 0x10)
+        assert observed_infos[0] == "Connection aborted by user."
+        assert tray._nid.uFlags == (1 | 2 | 4)
+        assert tray._nid.szInfo == ""
+        assert tray._nid.szInfoTitle == ""
+
+        # Subsequent set_state("connected") must keep NIF_INFO cleared and szInfo empty
+        tray.set_state("connected")
+        assert observed_flags[1] == (1 | 2 | 4)
+        assert observed_infos[1] == ""
+
+    def test_softether_and_ras_owner_guards_prevent_stale_cleanup(self):
+        """Superseded SoftEther and Windows RAS attempts must not tear down newer session's account, profile, or routes."""
+        # 1. SoftEther ownership
+        se1 = SoftEtherBackend()
+        se2 = SoftEtherBackend()
+        oid1 = se1._claim_ownership()
+        oid2 = se2._claim_ownership()
+        assert oid2 > oid1
+
+        with mock.patch.object(SoftEtherBackend, "_run_commands") as mock_se_cmd:
+            se1.abort(mock.MagicMock())
+            mock_se_cmd.assert_not_called()
+            se1.disconnect({"interface": "eth0", "detail": {"owner_id": oid1}}, mock.MagicMock())
+            mock_se_cmd.assert_not_called()
+
+        # 2. Windows RAS ownership
+        p1 = _claim_ras_profile_owner("VPNGate")
+        _claim_ras_route_owner({"9.9.9.9"}, p1)
+        p2 = _claim_ras_profile_owner("VPNGate")
+        _claim_ras_route_owner({"9.9.9.9"}, p2)
+
+        with mock.patch("sys.platform", "win32"), \
+             mock.patch("subprocess.run") as mock_run, \
+             mock.patch("vpngate.backends._remove_windows_vpn_pbk_entry") as mock_pbk:
+            _cleanup_windows_ras("VPNGate", {"9.9.9.9"}, owner_id=p1)
+            mock_pbk.assert_not_called()
+            mock_run.assert_not_called()

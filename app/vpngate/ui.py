@@ -591,6 +591,8 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._spawning_worker: bool = False
         self._tunnel_dropped_from_connected: bool = False
         self._auto_reconnecting: bool = False
+        self._client_attempt_id: int = 0
+        self._connection_epoch: int = 0
         self._aborting = False                       # Stop pressed mid-dial
         self._auth_dialog: Optional[Adw.AlertDialog] = None
         self._dot_phase = 0                          # animated "connecting." dots
@@ -1705,14 +1707,20 @@ class VpnGateWindow(Adw.ApplicationWindow):
     # Connecting
     # ==================================================================
 
+    def _is_auto_reconnecting(self) -> bool:
+        return bool(
+            getattr(self, "_auto_reconnecting", False)
+            or getattr(self, "_auto_reconnect_timer_id", None) is not None
+        )
+
     def _can_connect(self) -> bool:
-        if getattr(self, "_aborting", False):
+        if getattr(self, "_aborting", False) or self._is_auto_reconnecting():
             return False
         return self.state in ("idle", "error") and \
             (self.selected is not None or self.recommended is not None)
 
     def _on_connect_clicked(self, *args) -> None:      # noqa: ANN001
-        if self.state in ("connecting", "authorizing"):
+        if self.state in ("connecting", "authorizing") or self._is_auto_reconnecting():
             if self._auth_dialog is not None:
                 return
             self._abort_connect()
@@ -1758,6 +1766,9 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self._cancel_auto_reconnect()
             self._auto_reconnect_attempt = 0
         if not server.supports(protocol):
+            if getattr(self, "_auto_reconnecting", False):
+                self._auto_reconnecting = False
+                self._update_buttons()
             self.toast(_("{host} does not speak this protocol").format(
                 host=server.hostname or server.ip))
             return
@@ -1765,6 +1776,9 @@ class VpnGateWindow(Adw.ApplicationWindow):
         if sys.platform == "win32" and protocol in (Protocol.OPENVPN, Protocol.SSLVP):
             backend = BACKENDS.get(protocol)
             if backend and not backend.available():
+                if getattr(self, "_auto_reconnecting", False):
+                    self._auto_reconnecting = False
+                    self._update_buttons()
                 self._prompt_missing_backend_windows(server, protocol)
                 return
 
@@ -1772,13 +1786,17 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._last_connected_protocol = protocol
         self._manual_disconnect = False
         self._notified_connected = False
+        self._tunnel_dropped_from_connected = False
         self._aborting = False
+        self._connection_epoch = getattr(self, "_connection_epoch", 0) + 1
         self._hide_chips()
         timeout = int(self.settings.get("connect_timeout", DEFAULT_CONNECT_TIMEOUT))
         retries = int(self.settings.get("connect_retries", DEFAULT_CONNECT_RETRIES))
         if self.worker is not None and self.worker.poll() is None:
+            self._client_attempt_id = getattr(self, "_client_attempt_id", 0) + 1
             self._send({"cmd": "connect", "protocol": protocol.value,
                         "server": server.to_dict(),
+                        "attempt_id": self._client_attempt_id,
                         "timeout": timeout, "retries": retries})
             self._set_state("connecting",
                             _("Dialing {host} via {proto} …").format(
@@ -1789,15 +1807,28 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._start_authorization()
 
     def _abort_connect(self) -> None:
-        """Stop pressed while dialing/authorizing: return to the idle view immediately."""
-        if self.state not in ("connecting", "authorizing"):
+        """Stop pressed while dialing/authorizing/reconnecting: return to the idle view."""
+        is_dialing = self.state in ("connecting", "authorizing")
+        is_auto_reconn = self._is_auto_reconnecting()
+        if not is_dialing and not is_auto_reconn:
             return
         self._manual_disconnect = True
         self._auto_reconnect_attempt = 0
         self._cancel_auto_reconnect()
         self._auto_reconnecting = False
-        self._aborting = True
+        self._tunnel_dropped_from_connected = False
+        self._connection_epoch = getattr(self, "_connection_epoch", 0) + 1
         self._pending = None
+        if not is_dialing:
+            # Stopped during auto-reconnect cooldown timer (no worker dial currently in flight).
+            self._aborting = False
+            self._client_attempt_id = getattr(self, "_client_attempt_id", 0) + 1
+            self._append_log(_("Stop pressed — auto-reconnect cancelled"))
+            self.state = "idle"
+            self._set_state("idle", _("Connection attempt stopped."))
+            self._update_buttons()
+            return
+        self._aborting = True
         self._append_log(_("Stop pressed — aborting the connection attempt"))
         if self._auth_dialog is not None:
             try:
@@ -1808,7 +1839,11 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self.connect_btn.set_sensitive(False)
         if self.worker is not None and self.worker.poll() is None:
             self.hero_sub.set_text(_("Stopping …"))
-            self._send({"cmd": "abort"})
+            payload = {"cmd": "abort"}
+            aid = getattr(self, "_client_attempt_id", 0)
+            if aid:
+                payload["attempt_id"] = aid
+            self._send(payload)
         elif getattr(self, "_spawning_worker", False):
             self.hero_sub.set_text(_("Stopping …"))
         else:
@@ -2028,6 +2063,12 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._spawning_worker = False
         was_connected = getattr(self, "_notified_connected", False) or (self.state == "connected")
         self._notified_connected = False
+        self._tunnel_dropped_from_connected = False
+        self._auto_reconnecting = False
+        self._auto_reconnect_attempt = 0
+        self._cancel_auto_reconnect()
+        self._client_attempt_id = getattr(self, "_client_attempt_id", 0) + 1
+        self._connection_epoch = getattr(self, "_connection_epoch", 0) + 1
         self.worker = None
         self.worker_method = ""
         self._sudo_password = None
@@ -2065,6 +2106,11 @@ class VpnGateWindow(Adw.ApplicationWindow):
     # -- events --------------------------------------------------------------
     def _dispatch_event(self, event: dict) -> bool:
         kind = event.get("event")
+        event_aid = event.get("attempt_id")
+        if kind in ("state", "connected", "error") and event_aid is not None:
+            current_aid = getattr(self, "_client_attempt_id", 0)
+            if current_aid and event_aid != current_aid:
+                return False
         if kind == "log":
             self._append_log(event.get("text", ""))
         elif kind == "ready":
@@ -2092,7 +2138,11 @@ class VpnGateWindow(Adw.ApplicationWindow):
                 # one is harmless).
                 self._append_log(_("Tunnel came up, but Stop was pressed — "
                                    "tearing it back down"))
-                self._send({"cmd": "disconnect"})
+                payload = {"cmd": "disconnect"}
+                aid = getattr(self, "_client_attempt_id", 0)
+                if aid:
+                    payload["attempt_id"] = aid
+                self._send(payload)
             else:
                 self.connected_info = info
                 self._session_started = time.time()
@@ -2143,6 +2193,10 @@ class VpnGateWindow(Adw.ApplicationWindow):
             if self._aborting:
                 return                       # Stop wins; disconnect is queued
             info = self.connected_info or {}
+            self._auto_reconnect_attempt = 0
+            self._cancel_auto_reconnect()
+            self._auto_reconnecting = False
+            self._tunnel_dropped_from_connected = False
             self.state = "connected"
             self.hero_ring.set_mode("connected")
             self.hero_title.set_label(_("Protected"))
@@ -2181,6 +2235,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
             )
             self._tunnel_dropped_from_connected = False
             self._notified_connected = False
+            self._connection_epoch = getattr(self, "_connection_epoch", 0) + 1
             if stopped:
                 self.state = "idle"
                 self.hero_ring.set_mode("idle")
@@ -2211,13 +2266,17 @@ class VpnGateWindow(Adw.ApplicationWindow):
                 self._schedule_auto_reconnect()
             else:
                 self._auto_reconnecting = False
+                self._update_buttons()
 
     def _handle_connected(self, info: dict) -> None:
         self._auto_reconnect_attempt = 0
         self._cancel_auto_reconnect()
         self._auto_reconnecting = False
+        self._tunnel_dropped_from_connected = False
+        self._connection_epoch = getattr(self, "_connection_epoch", 0) + 1
         self._has_logged_first_probe = False
         self._watchdog_failures = 0
+        self._watchdog_last_check = time.time()
         self._last_connectivity_log_time = 0.0
         texts = (
             (self.chip_server, "🔒 " + str(info.get("server") or "-")),
@@ -2235,7 +2294,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
 
     # -- 1 Hz heartbeat ------------------------------------------------------
     def _tick(self) -> bool:
-        if self.state in ("connecting", "authorizing"):
+        if self.state in ("connecting", "authorizing") and not getattr(self, "_aborting", False):
             # Animate the headline: "Connecting" → "Connecting." → ".." → "…"
             self._dot_phase = (self._dot_phase + 1) % 4
             pulse = ("", ".", "..", "…")[self._dot_phase]
@@ -2254,10 +2313,11 @@ class VpnGateWindow(Adw.ApplicationWindow):
             if not self._watchdog_in_flight and (now - self._watchdog_last_check) >= interval:
                 self._watchdog_last_check = now
                 self._watchdog_in_flight = True
-                threading.Thread(target=self._run_watchdog_probe, daemon=True).start()
+                probe_epoch = getattr(self, "_connection_epoch", 0)
+                threading.Thread(target=self._run_watchdog_probe, args=(probe_epoch,), daemon=True).start()
         return True
 
-    def _run_watchdog_probe(self) -> None:
+    def _run_watchdog_probe(self, probe_epoch: Optional[int] = None) -> None:
         targets = [t for t in self.connectivity_targets if self.connectivity_target_states.get(t, True)]
         if not targets:
             self._watchdog_in_flight = False
@@ -2277,7 +2337,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
 
         def on_probe_done() -> bool:
             self._watchdog_in_flight = False
-            if self.state != "connected":
+            if (probe_epoch is not None and probe_epoch != getattr(self, "_connection_epoch", 0)) or self.state != "connected":
                 self._watchdog_failures = 0
                 return False
 
@@ -2314,7 +2374,11 @@ class VpnGateWindow(Adw.ApplicationWindow):
                     self.hero_sub.set_text(_("Internet or tunnel connection dropped."))
                     self.state = "error"
                     self._update_buttons()
-                    self._send({"cmd": "disconnect"})
+                    payload = {"cmd": "disconnect"}
+                    aid = getattr(self, "_client_attempt_id", 0)
+                    if aid:
+                        payload["attempt_id"] = aid
+                    self._send(payload)
             return False
 
         GLib.idle_add(on_probe_done)
@@ -2329,6 +2393,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         protocol = getattr(self, "_last_connected_protocol", None)
         if server is None:
             self._auto_reconnecting = False
+            self._update_buttons()
             return
         if protocol is None:
             target_proto = Protocol.SSTP if sys.platform == "win32" else Protocol.SSLVP
@@ -2344,6 +2409,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self.toast(_("Auto-reconnect stopped: max attempts reached"))
             self._auto_reconnecting = False
             self._auto_reconnect_attempt = 0
+            self._update_buttons()
             return
 
         self._auto_reconnecting = True
@@ -2364,6 +2430,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self._auto_reconnect_timer_id = None
             if getattr(self, "_aborting", False) or getattr(self, "_manual_disconnect", False) or self.state in ("connecting", "authorizing", "connected"):
                 self._auto_reconnecting = False
+                self._update_buttons()
                 return False
             self._append_log(_("[auto-reconnect] Initiating reconnect attempt {attempt}/{max_attempts} to {host} ...").format(
                 attempt=attempts, max_attempts=max_attempts, host=host))
@@ -2371,6 +2438,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
             return False
 
         self._auto_reconnect_timer_id = GLib.timeout_add_seconds(delay, do_reconnect)
+        self._update_buttons()
 
     def _cancel_auto_reconnect(self) -> None:
         timer_id = getattr(self, "_auto_reconnect_timer_id", None)
@@ -2414,6 +2482,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
     def _update_buttons(self) -> None:
         self.connect_btn.remove_css_class("suggested-action")
         self.connect_btn.remove_css_class("destructive-action")
+        is_auto_reconn = self._is_auto_reconnecting()
         if getattr(self, "_aborting", False):
             self.connect_btn.props.label = _("Stopping …")
             self.connect_btn.remove_css_class("suggested-action")
@@ -2424,7 +2493,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self.connect_btn.add_css_class("destructive-action")
             self.connect_btn.set_tooltip_text(_("Disconnect the tunnel"))
             self.connect_btn.set_sensitive(True)
-        elif self.state in ("connecting", "authorizing"):
+        elif self.state in ("connecting", "authorizing") or is_auto_reconn:
             # Stop: give up on the attempt and return to the previous view.
             self.connect_btn.props.label = _("Stop")
             self.connect_btn.add_css_class("destructive-action")
@@ -2439,12 +2508,13 @@ class VpnGateWindow(Adw.ApplicationWindow):
                   "relay (Enter)"))
             self.connect_btn.set_sensitive(self._can_connect())
         self.header_spinner.set_visible(
-            self.state in ("connecting", "authorizing") and not getattr(self, "_aborting", False))
+            (self.state in ("connecting", "authorizing") or is_auto_reconn) and not getattr(self, "_aborting", False))
         if self.tray is not None:
-            self.tray.set_state(self.state or "idle")
+            tray_state = "connecting" if (is_auto_reconn and self.state in ("idle", "error")) else (self.state or "idle")
+            self.tray.set_state(tray_state)
             self.tray.set_menu(
                 connect_enabled=self._can_connect(),
-                disconnect_enabled=(self.state in ("connected", "connecting", "authorizing")))
+                disconnect_enabled=(self.state in ("connected", "connecting", "authorizing") or is_auto_reconn))
 
     # ==================================================================
     # Settings / about
@@ -3396,8 +3466,9 @@ class VpnGateWindow(Adw.ApplicationWindow):
             self.tray = Tray(ICONS_DIR, self._on_tray_action)
             if self.tray.is_available():
                 self.tray.set_state(self.state or "idle")
-                self.tray.set_menu(connect_enabled=self._can_connect(),
-                                   disconnect_enabled=(self.state in ("connected", "connecting", "authorizing")))
+                self.tray.set_menu(
+                    connect_enabled=self._can_connect(),
+                    disconnect_enabled=(self.state in ("connected", "connecting", "authorizing") or self._is_auto_reconnecting()))
                 if not getattr(self, "_app_held", False):
                     self.app.hold()
                     self._app_held = True
@@ -3481,7 +3552,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
             GLib.idle_add(self.act_connect_quick)
         elif action == "disconnect":
             def do_disconnect():
-                if self.state in ("connecting", "authorizing"):
+                if self.state in ("connecting", "authorizing") or self._is_auto_reconnecting():
                     self._abort_connect()
                 elif self.state == "connected":
                     self._disconnect()
@@ -3496,13 +3567,19 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self._auto_reconnect_attempt = 0
         self._cancel_auto_reconnect()
         self._auto_reconnecting = False
+        self._connection_epoch = getattr(self, "_connection_epoch", 0) + 1
         self._append_log(_("Disconnecting the tunnel …"))
-        self._send({"cmd": "disconnect"})
+        payload = {"cmd": "disconnect"}
+        aid = getattr(self, "_client_attempt_id", 0)
+        if aid:
+            payload["attempt_id"] = aid
+        self._send(payload)
 
     def _quit(self) -> None:
         self._manual_disconnect = True
         self._cancel_auto_reconnect()
         self._auto_reconnecting = False
+        self._connection_epoch = getattr(self, "_connection_epoch", 0) + 1
         self._send({"cmd": "quit"})
         self._stop_tray()
         self.get_application().quit()
