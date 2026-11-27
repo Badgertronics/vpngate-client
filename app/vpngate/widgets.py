@@ -279,15 +279,16 @@ def flag_text(code: str) -> str:
 
 
 def flag_widget(code: str, size: int = 20) -> Gtk.Widget:
-    """Return a country flag widget (SVG image if available, fallback to emoji label)."""
-    svg_path = get_flag_svg_path(code)
-    if svg_path:
-        img = Gtk.Image.new_from_file(svg_path)
-        img.set_pixel_size(size)
-        img.set_valign(Gtk.Align.CENTER)
-        img.set_halign(Gtk.Align.CENTER)
-        img.add_css_class("flag-icon")
-        return img
+    """Return a country flag widget (SVG on Windows; emoji label elsewhere)."""
+    if sys.platform == "win32":
+        svg_path = get_flag_svg_path(code)
+        if svg_path:
+            img = Gtk.Image.new_from_file(svg_path)
+            img.set_pixel_size(size)
+            img.set_valign(Gtk.Align.CENTER)
+            img.set_halign(Gtk.Align.CENTER)
+            img.add_css_class("flag-icon")
+            return img
     emoji = flag_text(code)
     lbl = Gtk.Label(label=emoji, css_classes=["flag"], valign=Gtk.Align.CENTER)
     if size >= 24:

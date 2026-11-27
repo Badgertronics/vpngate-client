@@ -69,6 +69,104 @@ else:
 ICONS_DIR = os.path.join(ROOT_DIR, "icons", "hicolor", "scalable", "apps")
 
 
+def _icon_base_dirs() -> List[str]:
+    """Return candidate base directories that may contain an ``icons/`` directory."""
+    pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    meipass = getattr(sys, "_MEIPASS", "") or ""
+    candidates = [
+        ROOT_DIR,
+        os.path.join(ROOT_DIR, "_internal"),
+        meipass,
+        pkg_root,
+        "/usr/lib/vpngate-client",
+        "/usr/share/vpngate-client",
+    ]
+    out: List[str] = []
+    for base in candidates:
+        if base and base not in out:
+            out.append(base)
+    return out
+
+
+def _register_icon_paths(display: Optional[Gdk.Display] = None) -> Optional[Gtk.IconTheme]:
+    """Ensure bundled app and action icons are registered on the active Gtk.IconTheme."""
+    if display is None:
+        display = Gdk.Display.get_default()
+    if display is None:
+        return None
+    theme = Gtk.IconTheme.get_for_display(display)
+    existing = set(theme.get_search_path() or ())
+    for base in _icon_base_dirs():
+        for rel in (
+            "icons",
+            os.path.join("icons", "hicolor", "scalable", "apps"),
+            os.path.join("icons", "hicolor", "scalable", "actions"),
+        ):
+            path = os.path.join(base, rel)
+            if os.path.isdir(path) and path not in existing:
+                theme.add_search_path(path)
+                existing.add(path)
+    return theme
+
+
+def _find_bundled_action_svg(filename: str) -> str:
+    """Return the filesystem path to a bundled scalable action SVG if available."""
+    for base in _icon_base_dirs():
+        path = os.path.join(base, "icons", "hicolor", "scalable", "actions", filename)
+        if os.path.isfile(path):
+            return path
+    return ""
+
+
+def _first_available_icon_name(theme: Optional[Gtk.IconTheme], *names: str) -> str:
+    """Return the first icon name available in *theme*, or an empty string."""
+    if theme is None:
+        return ""
+    for name in names:
+        try:
+            if theme.has_icon(name):
+                return name
+        except Exception:
+            pass
+    return ""
+
+
+def _resolve_icon_name(preferred: str, *fallbacks: str) -> str:
+    """Return the first available icon name in the active Gtk.IconTheme."""
+    theme = _register_icon_paths()
+    return _first_available_icon_name(theme, preferred, *fallbacks) or preferred
+
+
+def _apply_image_icon(img: Gtk.Image, icon_name: str, fallback_svg: str = "") -> None:
+    """Update *img* from *icon_name* in theme, or fall back to a bundled action SVG."""
+    theme = _register_icon_paths()
+    if _first_available_icon_name(theme, icon_name):
+        img.set_from_icon_name(icon_name)
+        return
+    if fallback_svg:
+        svg_path = _find_bundled_action_svg(fallback_svg)
+        if svg_path:
+            img.set_from_file(svg_path)
+            return
+    img.set_from_icon_name(icon_name)
+
+
+def _make_icon_widget(preferred: str, fallback_svg: str, *fallbacks: str, size: int = 16) -> Gtk.Image:
+    """Create a Gtk.Image from the active icon theme, falling back to a bundled SVG file."""
+    theme = _register_icon_paths()
+    found = _first_available_icon_name(theme, preferred, *fallbacks)
+    if found:
+        img = Gtk.Image.new_from_icon_name(found)
+    else:
+        svg_path = _find_bundled_action_svg(fallback_svg)
+        if svg_path:
+            img = Gtk.Image.new_from_file(svg_path)
+        else:
+            img = Gtk.Image.new_from_icon_name(fallbacks[0] if fallbacks else preferred)
+    img.set_pixel_size(size)
+    return img
+
+
 def _make_wrap_box(child_spacing: int = 6, line_spacing: int = 6, **kwargs) -> Gtk.Widget:
     """Create an Adw.WrapBox if Libadwaita >= 1.6, or fallback to Gtk.Box."""
     wrap_cls = getattr(Adw, "WrapBox", None)
@@ -525,17 +623,7 @@ class VpnGateApp(Adw.Application):
         display = Gdk.Display.get_default()
         if display is not None:
             apply_theme_css()
-            theme = Gtk.IconTheme.get_for_display(display)
-            for candidate in (
-                ICONS_DIR,
-                os.path.join(ROOT_DIR, "icons"),
-                os.path.join(ROOT_DIR, "icons", "hicolor", "scalable", "apps"),
-                os.path.join(os.path.dirname(__file__), "..", "icons", "hicolor", "scalable", "apps"),
-                os.path.join(os.path.dirname(__file__), "..", "icons"),
-            ):
-                if os.path.isdir(candidate):
-                    theme.add_search_path(candidate)
-                    theme.add_search_path(os.path.dirname(candidate))
+            _register_icon_paths(display)
         if getattr(self, "win", None) is not None:
             self.win.set_visible(True)
             self.win.present()
@@ -557,6 +645,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         super().__init__(application=app)
         self.app = app
         self.settings = app.settings
+        _register_icon_paths()
 
         self.servers: List[VpnServer] = []
         self.mirrors: List[str] = (self.settings.get("mirrors")
@@ -850,11 +939,36 @@ class VpnGateWindow(Adw.ApplicationWindow):
         self.sort_dd.connect("notify::selected-item", self._on_sort_changed)
         row_top.append(self.sort_dd)
 
+        ping_icon = self._ping_icon_name()
+        theme = _register_icon_paths()
+        use_button_content = hasattr(Adw, "ButtonContent") and bool(
+            _first_available_icon_name(theme, "vpngate-ping-symbolic", "network-transmit-receive-symbolic")
+        )
+        if use_button_content:
+            self._ping_all_content = Adw.ButtonContent(
+                label=_("Ping All"),
+                icon_name=ping_icon,
+            )
+            self._ping_all_icon = None
+            self._ping_all_label = None
+            ping_btn_child: Gtk.Widget = self._ping_all_content
+        else:
+            self._ping_all_content = None
+            self._ping_all_icon = _make_icon_widget(
+                "vpngate-ping-symbolic",
+                "vpngate-ping-symbolic.svg",
+                "network-transmit-receive-symbolic",
+                size=16,
+            )
+            self._ping_all_label = Gtk.Label(label=_("Ping All"))
+            ping_btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            ping_btn_box.append(self._ping_all_icon)
+            ping_btn_box.append(self._ping_all_label)
+            ping_btn_child = ping_btn_box
         self.ping_all_btn = Gtk.Button(
-            label=_("Ping All"),
-            icon_name="network-transmit-receive-symbolic",
+            child=ping_btn_child,
             tooltip_text=_("Ping all servers to test real reachability and delay"),
-            css_classes=["flat"]
+            css_classes=["flat"],
         )
         self.ping_all_btn.connect("clicked", self._on_ping_all_clicked)
         row_top.append(self.ping_all_btn)
@@ -939,10 +1053,70 @@ class VpnGateWindow(Adw.ApplicationWindow):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    @staticmethod
+    def _ping_icon_name() -> str:
+        """Resolve the symbolic ping icon, preferring our bundled asset."""
+        return _resolve_icon_name("vpngate-ping-symbolic", "network-transmit-receive-symbolic")
+
+    @staticmethod
+    def _ping_stop_icon_name() -> str:
+        """Resolve the symbolic stop icon with bundled fallback."""
+        return _resolve_icon_name("process-stop-symbolic", "vpngate-stop-symbolic")
+
+    def _set_ping_all_state(
+        self, label: str, icon_name: Optional[str] = None, fallback_svg: str = ""
+    ) -> None:
+        """Update Ping All button text and icon without replacing one with the other."""
+        if getattr(self, "_ping_all_content", None) is not None:
+            self._ping_all_content.set_label(label)
+            if icon_name is not None:
+                self._ping_all_content.set_icon_name(icon_name)
+            return
+        if getattr(self, "_ping_all_label", None) is not None:
+            self._ping_all_label.set_label(label)
+            if icon_name is not None and getattr(self, "_ping_all_icon", None) is not None:
+                _apply_image_icon(self._ping_all_icon, icon_name, fallback_svg)
+            return
+        self.ping_all_btn.set_label(label)
+        if icon_name is not None:
+            self.ping_all_btn.set_icon_name(icon_name)
+
+    def _build_ping_row_button(self, server: VpnServer) -> Gtk.Button:
+        """Create a per-row ping button whose icon renders across all Linux themes."""
+        tooltip = _("Ping this server to test your direct delay")
+        theme = _register_icon_paths()
+        found = _first_available_icon_name(
+            theme, "vpngate-ping-symbolic", "network-transmit-receive-symbolic"
+        )
+        if found:
+            btn = Gtk.Button(
+                icon_name=found,
+                css_classes=["flat", "circular"],
+                tooltip_text=tooltip,
+            )
+        else:
+            svg_path = _find_bundled_action_svg("vpngate-ping-symbolic.svg")
+            if svg_path:
+                img = Gtk.Image.new_from_file(svg_path)
+                img.set_pixel_size(16)
+                btn = Gtk.Button(
+                    child=img,
+                    css_classes=["flat", "circular", "image-button"],
+                    tooltip_text=tooltip,
+                )
+            else:
+                btn = Gtk.Button(
+                    icon_name="network-transmit-receive-symbolic",
+                    css_classes=["flat", "circular"],
+                    tooltip_text=tooltip,
+                )
+        btn.connect("clicked", lambda _b, s=server: self._ping_single_server(s))
+        return btn
+
     def _on_ping_all_clicked(self, *args) -> None:
         if getattr(self, "_pinging_all", False):
             self._ping_cancel = True
-            self.ping_all_btn.set_label(_("Stopping..."))
+            self._set_ping_all_state(_("Stopping..."))
             self.ping_all_btn.set_sensitive(False)
             self._append_log(_("[ping] Stopping latency testing ..."))
             return
@@ -954,8 +1128,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
 
         self._pinging_all = True
         self._ping_cancel = False
-        self.ping_all_btn.set_label(_("Stop Ping"))
-        self.ping_all_btn.set_icon_name("process-stop-symbolic")
+        self._set_ping_all_state(_("Stop Ping"), self._ping_stop_icon_name(), "vpngate-stop-symbolic.svg")
         self.ping_all_btn.add_css_class("destructive-action")
         self._append_log(_("[ping] Testing direct delay for {count} servers (in parallel) ...").format(count=len(servers_to_ping)))
 
@@ -998,7 +1171,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
                     def update_one(srv=s, c=completed, line=log_line):
                         self._append_log(line)
                         if getattr(self, "_pinging_all", False) and not getattr(self, "_ping_cancel", False):
-                            self.ping_all_btn.set_label(_("Stop ({done}/{total})").format(done=c, total=total))
+                            self._set_ping_all_state(_("Stop ({done}/{total})").format(done=c, total=total))
                         self._update_server_row_ping(srv)
                         if self.selected is srv:
                             self._show_details(srv)
@@ -1009,8 +1182,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
                 stopped = getattr(self, "_ping_cancel", False)
                 self._pinging_all = False
                 self._ping_cancel = False
-                self.ping_all_btn.set_label(_("Ping All"))
-                self.ping_all_btn.set_icon_name("network-transmit-receive-symbolic")
+                self._set_ping_all_state(_("Ping All"), self._ping_icon_name(), "vpngate-ping-symbolic.svg")
                 self.ping_all_btn.remove_css_class("destructive-action")
                 self.ping_all_btn.set_sensitive(True)
                 if stopped:
@@ -1599,10 +1771,7 @@ class VpnGateWindow(Adw.ApplicationWindow):
         row._rep_ping_chip = rep_c
         ping_box.append(rep_c)
 
-        ping_btn = Gtk.Button(icon_name="network-transmit-receive-symbolic",
-                              css_classes=["flat", "circular"],
-                              tooltip_text=_("Ping this server to test your direct delay"))
-        ping_btn.connect("clicked", lambda _b, s=server: self._ping_single_server(s))
+        ping_btn = self._build_ping_row_button(server)
         ping_box.append(ping_btn)
 
         right.append(ping_box)
